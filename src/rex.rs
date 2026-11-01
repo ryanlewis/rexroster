@@ -195,9 +195,32 @@ pub mod fake {
     pub struct Fake {
         pub responses: RefCell<HashMap<String, Value>>,
         pub calls: RefCell<Vec<(String, Value)>>,
+        /// Methods that fail, keyed like `responses`.
+        pub failing: RefCell<Vec<String>>,
     }
 
     impl Fake {
+        /// Make `method` fail until [`Fake::heal`].
+        pub fn fail(&self, method: &str) {
+            self.failing.borrow_mut().push(method.to_owned());
+        }
+
+        pub fn heal(&self) {
+            self.failing.borrow_mut().clear();
+        }
+
+        fn answer(&self, key: &str) -> Result<Value> {
+            if self.failing.borrow().iter().any(|m| m == key) {
+                bail!("{key}: boom");
+            }
+            Ok(self
+                .responses
+                .borrow()
+                .get(key)
+                .cloned()
+                .unwrap_or(Value::Null))
+        }
+
         pub fn on(&self, method: &str, response: Value) {
             self.responses
                 .borrow_mut()
@@ -221,12 +244,7 @@ pub mod fake {
     impl Rex for Fake {
         fn call(&self, method: &str, params: Value) -> Result<Value> {
             self.calls.borrow_mut().push((method.to_owned(), params));
-            Ok(self
-                .responses
-                .borrow()
-                .get(method)
-                .cloned()
-                .unwrap_or(Value::Null))
+            self.answer(method)
         }
 
         fn block_call(&self, _session: &str, block: &str, method: &str) -> Result<Value> {
@@ -234,12 +252,7 @@ pub mod fake {
             self.calls
                 .borrow_mut()
                 .push((key.clone(), Value::String(block.to_owned())));
-            Ok(self
-                .responses
-                .borrow()
-                .get(&key)
-                .cloned()
-                .unwrap_or(Value::Null))
+            self.answer(&key)
         }
     }
 }

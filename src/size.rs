@@ -10,7 +10,35 @@ pub const MAX_HEIGHT: f64 = 0.6;
 /// The fewest rows the layer shrinks to: one line plus about a row of window chrome.
 pub const MIN_ROWS: f64 = 2.0;
 
+use std::time::Duration;
+
 use crate::config::Border;
+
+/// The first wait before measuring again while the pane hasn't been drawn.
+/// Each wait doubles, up to `RETRY_STEP_MAX`.
+pub const RETRY_FIRST: Duration = Duration::from_millis(100);
+pub const RETRY_STEP_MAX: Duration = Duration::from_secs(1);
+/// The most the retries wait in all, after which the layer keeps its height
+/// until something else (a resize, a new row count) asks for a fit.
+pub const RETRY_TOTAL: Duration = Duration::from_secs(5);
+
+/// The wait before retry number `n` (from 0), or `None` once the waits so far
+/// plus this one would pass `RETRY_TOTAL`.
+pub fn retry_delay(n: u32) -> Option<Duration> {
+    let step = |i: u32| {
+        RETRY_FIRST
+            .checked_mul(1 << i.min(16))
+            .map_or(RETRY_STEP_MAX, |d| d.min(RETRY_STEP_MAX))
+    };
+    let mut total = Duration::ZERO;
+    for i in 0..=n {
+        total += step(i);
+        if total > RETRY_TOTAL {
+            return None;
+        }
+    }
+    Some(step(n))
+}
 
 /// Rows the border takes: none, or a top and bottom line.
 pub fn chrome_rows(border: Border) -> u16 {
@@ -130,6 +158,21 @@ mod tests {
             assert!(resizes < 3, "bouncing");
         }
         assert_eq!(rows_of(h), want);
+    }
+
+    #[test]
+    fn retries_back_off_and_stop_within_the_total() {
+        let ms = Duration::from_millis;
+        assert_eq!(retry_delay(0), Some(ms(100)));
+        assert_eq!(retry_delay(1), Some(ms(200)));
+        assert_eq!(retry_delay(3), Some(ms(800)));
+        // Capped at a second a step.
+        assert_eq!(retry_delay(4), Some(RETRY_STEP_MAX));
+        let waits: Vec<_> = (0..).map_while(retry_delay).collect();
+        let total: Duration = waits.iter().sum();
+        assert!(total <= RETRY_TOTAL, "{total:?}");
+        assert!(total > RETRY_TOTAL - RETRY_STEP_MAX, "{total:?}");
+        assert_eq!(retry_delay(u32::MAX), None);
     }
 
     #[test]

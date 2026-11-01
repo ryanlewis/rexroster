@@ -294,10 +294,14 @@ impl Model {
         }
     }
 
+    /// Whether a block's meta record names our lead. The lead and the
+    /// roster are never in `blocks`, so this is all a worker needs.
+    fn is_ours(&self, b: &Block) -> bool {
+        b.meta().is_some_and(|m| m.lead == self.lead)
+    }
+
     fn workers(&self) -> impl Iterator<Item = (&String, &Block)> {
-        self.blocks
-            .iter()
-            .filter(|(_, b)| b.meta().is_some_and(|m| m.lead == self.lead))
+        self.blocks.iter().filter(|(_, b)| self.is_ours(b))
     }
 
     pub fn rows(&self, now: u64) -> Vec<Row> {
@@ -338,10 +342,9 @@ impl Model {
     /// `session.view` snapshot). Minimizing a shown worker hides it, so these
     /// get detached.
     pub fn to_detach(&self, view: &Value) -> Vec<String> {
-        let mine: Vec<&String> = self.workers().map(|(id, _)| id).collect();
         rex::minimized_blocks(view)
             .into_iter()
-            .filter(|b| mine.contains(&b) && !self.ignored(b))
+            .filter(|id| self.blocks.get(id).is_some_and(|b| self.is_ours(b)))
             .collect()
     }
 
@@ -792,6 +795,10 @@ mod tests {
         m.apply(meta("block:theirs", "block:other-lead", None), 0);
         let view: Value =
             serde_json::from_str(include_str!("../testdata/view-minimized.json")).unwrap();
+        assert_eq!(m.to_detach(&view), ["block:mini"]);
+        // The minimized roster is never detached, even when its own meta
+        // record names the lead: its events never reach the model.
+        m.apply(meta("block:roster", "block:lead", None), 0);
         assert_eq!(m.to_detach(&view), ["block:mini"]);
 
         // After the detach the block is in no layer, so the next pass finds nothing.
