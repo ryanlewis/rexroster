@@ -44,7 +44,7 @@ Every command reads the session from `$REX_SESSION` and stops with an error if i
 `tag` writes this sequence to `/dev/tty` (to stdout if there is no terminal), then runs the command whether or not the write worked:
 
 ```text
-ESC ] 7501 ; state=idle:id=meta:app=rexlead:msg=<base64 of {"lead":…,"task":…}> ESC \
+ESC ] 7501 ; state=idle:id=meta:app=rexlead:msg=<base64 of {"lead":…,"task":…,"cwd":…}> ESC \
 ```
 
 The roster lists a block only when this record names its own lead.
@@ -58,7 +58,7 @@ By default the roster has no frame or title, because Rex's pane title already na
 - `▸` if the worker is shown
 - the label, in a column as wide as the longest label (6 to 20 characters)
 - the time in the current state
-- the record's message, or the task when there is no message, cut with `…` to fit
+- the record's message, or the task when there is no message, cut with `…` to fit When the record carries the worker's `cwd`, that path in the message shows as `.`, and a leading `cd <cwd> && ` or `cd <cwd>; ` is dropped.
 
 Press `v` for the expanded view. Each worker then has a line with its label and time, then its message wrapped to the pane width (at most 3 lines), then its task in dim text if that differs from the message.
 
