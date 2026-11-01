@@ -95,10 +95,11 @@ struct App<'a> {
     focused: bool,
     /// The worker last clicked, and when, to spot a double-click.
     last_click: Option<(String, Instant)>,
-    /// The last Rex or save error. It goes on the next key press, and on the
-    /// next refresh or action that works.
+    /// The last Rex error. It goes on the next key press, and on the next
+    /// refresh or action that works.
     error: Option<String>,
-    /// A problem loading the config file. It goes on the next key press only.
+    /// A problem loading or saving the config file. It goes on the next key
+    /// press only, so an unrelated refresh can't hide it.
     config_error: Option<String>,
     fit: Fit,
     /// The `session.view` this pass fetched, so a fit in the same pass
@@ -508,6 +509,8 @@ impl App<'_> {
                 if !ours {
                     self.fit.attempts = 0;
                 }
+                // A new client may not have drawn the pane yet.
+                self.fit.retries = 0;
             }
             _ => {}
         }
@@ -529,7 +532,7 @@ impl App<'_> {
                 "no config directory: set HOME or XDG_CONFIG_HOME"
             )),
         };
-        self.report(res);
+        self.config_error = res.err().map(|err| format!("{err:#}"));
     }
 
     fn step(&mut self, rows: &[Row], by: isize) {
@@ -1718,7 +1721,7 @@ mod tests {
 
         a.on_terminal_event(&key('o'), &[]);
         assert!(a.panel.is_none());
-        assert_eq!(a.error, None);
+        assert_eq!(a.shown_error(), None);
         let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
         assert_eq!(text, "border = \"rounded\"\n");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1734,7 +1737,7 @@ mod tests {
         assert!(a.expanded());
         // With nowhere to save, closing reports it.
         a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
-        assert!(a.error.as_deref().unwrap().contains("no config directory"));
+        assert!(a.shown_error().unwrap().contains("no config directory"));
     }
 
     #[test]
@@ -1887,7 +1890,7 @@ mod tests {
         a.on_terminal_event(&key('o'), &[]);
         assert!(render_at(&mut a, &[], 32, 4).contains("view    expanded"));
         a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
-        assert_eq!(a.error, None);
+        assert_eq!(a.shown_error(), None);
         assert!(a.expanded());
         a.on_terminal_event(&key('v'), &[]);
         assert!(!a.expanded());
@@ -1950,5 +1953,44 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("\x1b[?1004l"), "focus reports: {out:?}");
         assert!(out.contains("\x1b[?1000l"), "mouse capture: {out:?}");
+    }
+
+    #[test]
+    fn a_failed_save_survives_the_refresh_that_closing_the_panel_causes() {
+        // Review finding: the panel closes, the layer resizes, and the view
+        // event's refresh wiped the save error before it was drawn.
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('o').into()), &[]);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Enter.into()), &[]);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
+        a.sync(Needs {
+            blocks: true,
+            view: true,
+        });
+        let screen = render_at(&mut a, &[], 45, 1);
+        assert!(screen.contains("no config directory"), "{screen}");
+    }
+
+    #[test]
+    fn a_resize_after_the_retries_ran_out_gets_new_ones() {
+        // Review finding: no client for 5 s, then one attaches and its first
+        // Resize lands before the pane reports a drawn size.
+        let rex = Fake::default();
+        sized(&rex, 1);
+        rex.on(
+            "block:roster size",
+            json!({"rows": 24, "columns": 80, "desired": []}),
+        );
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        while a.fit.dirty || a.fit.retry_at.is_some() {
+            a.fit.retry_at = a.fit.retry_at.map(|_| Instant::now());
+            a.fit_if_due();
+        }
+        a.on_terminal_event(&TermEvent::Resize(48, 5), &[]);
+        a.fit_if_due();
+        assert!(a.fit.retry_at.is_some(), "the resize's fit is retried");
     }
 }
