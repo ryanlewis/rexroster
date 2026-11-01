@@ -18,18 +18,21 @@ From the lead's pane:
 rexroster spawn "$REX_BLOCK" fix-login --task "fix the login redirect" --cwd ~/dev/app -- "$(command -v claude)" "…"
 ```
 
-This starts the worker as a detached block and opens the roster if it isn't open already. The roster closes itself when the last worker's block closes.
+This starts the worker as a detached block and opens the roster if it isn't open already. The roster closes itself when the last worker's block closes. It also starts the [watcher](#the-watcher), which brings a worker into view when it is waiting on a prompt.
 
 ## Commands
 
-Every command reads the session from `$REX_SESSION` and stops with an error if it is not set.
+Every command except `watch` reads the session from `$REX_SESSION` and stops with an error if it is not set.
 
 | Command | What it does |
 | --- | --- |
 | `rexroster [--lead <block-id>] [--border none\|rounded] [--view compact\|expanded]` | Runs the roster for a lead. `--lead` defaults to `$REXROSTER_LEAD`. `--border` and `--view` override the config file for this run. |
-| `rexroster open <lead-block-id> [--border …] [--view …]` | Opens the lead's roster in a floating layer at the top right of the lead's tab, without focus, unless a block labelled `roster-<last 6 characters of the lead id>` already exists. Prints the new layer id, or nothing. Exits 0 in both cases. Passes `--border` and `--view` on to the roster. |
+| `rexroster open <lead-block-id> [--border …] [--view …]` | Opens the lead's roster in a floating layer at the top right of the lead's tab, without focus, unless a block labelled `roster-<last 6 characters of the lead id>` already exists. Prints the new layer id, or nothing. Exits 0 in both cases. Passes `--border` and `--view` on to the roster. Then starts the watcher, if the config's `watch` is on and no watcher is running. |
 | `rexroster spawn <lead-block-id> <name> [--task <text>] [--cwd <dir>] -- <cmd> [args...]` | Starts a detached block labelled `<name>` that runs `rexroster tag <lead> [--task <text>] -- <cmd...>`, then does what `open` does. Prints `{"block_id":"…","roster_layer_id":"…"}`, where `roster_layer_id` is `null` if the roster was already open. |
 | `rexroster tag <lead-block-id> [--task <text>] -- <cmd> [args...]` | Marks the terminal as the lead's worker, then replaces itself with `<cmd>`. |
+| `rexroster watch` | Runs the watcher in the foreground. Exits at once, with status 0, if a watcher is already running for this user and Rex server. |
+
+Two `open` or `spawn` calls at the same time make only one roster: each holds a lock file while it checks for the roster and creates it.
 
 ### Running the worker's command
 
@@ -81,6 +84,26 @@ The spinner redraws every 100 ms while any worker is working. Otherwise the rost
 
 Focus key: `cmd+alt+R` (physical key `KeyR`, action `roster_toggle`) switches focus between the lead and its roster. The binding lives in Rex's `init.lua`. After you change that file, for example with a dotfiles tool such as chezmoi, run `rex config reload`.
 
+## The watcher
+
+`rexroster watch` floats a detached worker into view when it is waiting on you, and puts it back when it moves on:
+
+- When a detached block's own status record turns `blocked` (for example a Claude Code permission prompt), the watcher moves it into its session's active window as a large floating pane.
+- When the record turns to any other state, or goes away, the watcher detaches the block again. If the block closed, there is nothing to do.
+- Blocks that are already in a window are left alone.
+
+It watches every session on the Rex server, including ones created later. The work is done by a Lua script built into the binary ([`lua/blocked-float.lua`](lua/blocked-float.lua)). The watcher replaces itself with `rex do -e <script> --all`, so in a process list it shows as `rex do`.
+
+`open` and `spawn` start the watcher in the background, in its own session with no terminal, so closing the shell or the roster does not stop it. Set `watch = false` in the config to turn this off.
+
+Only one watcher runs per user per Rex server. It holds a lock file in `$XDG_RUNTIME_DIR/rexroster/`, or in `rexroster-<uid>/` under the temp directory when `XDG_RUNTIME_DIR` is not set, for as long as it runs. A second watcher finds the lock taken and exits. The lock goes when the process ends, however it ends.
+
+The watcher runs until the Rex server goes away or the process is killed. It reads `notify` when it starts, so restart it after changing that option: kill the `rex do` process, and the next `open` or `spawn` starts a new one.
+
+### Notifications
+
+With `notify = "cases"`, the watcher also opens a "stuck" case with the prompt's message when it floats a worker, and withdraws the case when the worker sinks. This needs an external `cases` CLI on `PATH`; rexroster does not provide it. With `notify = "none"` (the default) the watcher only floats and sinks.
+
 ## Options
 
 Options live in `$XDG_CONFIG_HOME/rexroster/config.toml`, or `~/.config/rexroster/config.toml` when `XDG_CONFIG_HOME` is not set:
@@ -88,6 +111,8 @@ Options live in `$XDG_CONFIG_HOME/rexroster/config.toml`, or `~/.config/rexroste
 ```toml
 border = "rounded"   # "none" (default) or "rounded": a box titled "workers"
 view = "expanded"    # "compact" (default) or "expanded": the view the roster starts in
+watch = false        # true (default) or false: whether open and spawn start the watcher
+notify = "cases"     # "none" (default) or "cases": see Notifications above
 ```
 
 A missing file or key means the default, and unknown keys are ignored. If the file can't be parsed, the roster shows one error line and uses the defaults. `--border` and `--view` on the command line win over the file.
