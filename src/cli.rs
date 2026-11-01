@@ -113,6 +113,9 @@ pub enum Command {
         #[arg(last = true, required = true)]
         cmd: Vec<OsString>,
     },
+    /// Print a guide for AI agents: how a lead agent uses rexroster to run
+    /// worker sessions. Needs no Rex session.
+    Skill,
 }
 
 #[cfg(test)]

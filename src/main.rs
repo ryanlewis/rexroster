@@ -27,8 +27,15 @@ fn main() -> ExitCode {
     }
 }
 
+/// The agent guide that `rexroster skill` prints.
+const AGENT_GUIDE: &str = include_str!("../docs/agent.md");
+
 fn run(cli: Cli) -> Result<()> {
     let display = cli.subcommand_display()?;
+    if let Some(Command::Skill) = cli.command {
+        print!("{AGENT_GUIDE}");
+        return Ok(());
+    }
     if let Some(Command::Watch) = cli.command {
         // The watcher hears every session, so it needs no REX_SESSION.
         let opts = config::load_strict(config::path().as_deref())?;
@@ -97,7 +104,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Tag { lead, task, cmd }) => tag::run(&lead, task.as_deref(), &cmd),
-        Some(Command::Watch) => unreachable!("handled above"),
+        Some(Command::Watch | Command::Skill) => unreachable!("handled above"),
     }
 }
 
@@ -116,5 +123,27 @@ fn start_watcher(exe: &std::path::Path) {
     }
     if let Err(err) = watch::start(exe, &watch::lock_path()) {
         eprintln!("rexroster: couldn't start the watcher: {err:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn agent_guide_is_not_empty() {
+        assert!(AGENT_GUIDE.trim().len() > 100);
+    }
+
+    #[test]
+    fn agent_guide_names_every_subcommand() {
+        for sub in Cli::command().get_subcommands() {
+            let name = format!("rexroster {}", sub.get_name());
+            assert!(
+                AGENT_GUIDE.contains(&name),
+                "the guide never mentions `{name}`"
+            );
+        }
     }
 }

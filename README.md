@@ -30,7 +30,7 @@ This starts the worker as a detached block and opens the roster if it isn't open
 
 ## Commands
 
-Every command except `watch` reads the session from `$REX_SESSION` and stops with an error if it is not set.
+Every command except `watch` and `skill` reads the session from `$REX_SESSION` and stops with an error if it is not set.
 
 | Command | What it does |
 | --- | --- |
@@ -39,6 +39,7 @@ Every command except `watch` reads the session from `$REX_SESSION` and stops wit
 | `rexroster spawn <lead-block-id> <name> [--task <text>] [--cwd <dir>] -- <cmd> [args...]` | Starts a detached block labelled `<name>` that runs `rexroster tag <lead> [--task <text>] -- <cmd...>`, then does what `open` does. Prints `{"block_id":"…","roster_layer_id":"…"}`, where `roster_layer_id` is `null` if the roster was already open. |
 | `rexroster tag <lead-block-id> [--task <text>] -- <cmd> [args...]` | Marks the terminal as the lead's worker, then replaces itself with `<cmd>`. |
 | `rexroster watch` | Runs the watcher in the foreground. Exits at once, with status 0, if a watcher is already running for this user and Rex server. |
+| `rexroster skill` | Prints the guide for AI agents, from [`docs/agent.md`](docs/agent.md). |
 
 Two `open` or `spawn` calls at the same time make only one roster: each holds a lock file while it checks for the roster and creates it.
 
@@ -59,6 +60,10 @@ ESC ] 7501 ; state=idle:id=meta:app=rexlead:msg=<base64 of {"lead":…,"task":�
 ```
 
 The roster lists a block only when this record names its own lead.
+
+### Using it from an agent
+
+`rexroster skill` prints a guide for an AI agent acting as the lead: how to start workers, read their state, show, hide and close them, and the traps to avoid. The guide is built into the binary, so it always matches the installed version. Point the agent at `rexroster skill` rather than copying the guide into its instructions.
 
 ## The roster
 
