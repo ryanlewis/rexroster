@@ -4,6 +4,12 @@ rexroster is a small terminal UI and command-line tool for [Rex](https://www.sup
 
 Claude Code tells Rex what it is doing (working, waiting on a prompt, done) through Rex's [program status protocol](https://www.superlogical.com/rex/docs/build/program-status), and the roster shows that state for each worker. Any other program that sends those records works the same way.
 
+rexroster is intended to be used mainly by your lead agents, not directly by you. Point a lead at `rexroster skill`, which prints a guide to starting and managing workers, and it runs the commands below itself. What you work with is the roster pane.
+
+![The roster in its floating pane as a lead starts four workers. Each shows a spinner and its current step, then a tick when it finishes. With focus, the roster switches to the expanded view and back, and turns on a border from its options panel.](docs/demo/demo.gif)
+
+To run this demo yourself, run `docs/demo/demo.sh` from a Rex pane. Its workers are pretend ones that send the same status records Claude Code does.
+
 ## Requirements
 
 - Rex, with its `rex` CLI. rexroster finds it at `$REX_BIN_DIR/rex` (Rex sets this in every terminal) or on `PATH`. Rex is in beta; see its [installation page](https://www.superlogical.com/rex/docs/installation).
@@ -20,7 +26,7 @@ or, from a clone, `cargo install --locked --path .`.
 
 ## Typical use
 
-From the lead's pane:
+The lead agent runs this from its own pane:
 
 ```sh
 rexroster spawn "$REX_BLOCK" fix-login --task "fix the login redirect" --cwd ~/dev/app -- "$(command -v claude)" "…"
