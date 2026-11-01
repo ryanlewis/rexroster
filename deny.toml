@@ -1,0 +1,31 @@
+# cargo deny check: security advisories, licences, duplicate crates and sources.
+
+[graph]
+all-features = true
+
+[advisories]
+# Yanked crates fail the check too.
+yanked = "deny"
+
+[licenses]
+# Every licence in the dependency tree has to be on this list.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSL-1.0",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
