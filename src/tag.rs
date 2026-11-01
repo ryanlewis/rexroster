@@ -13,12 +13,17 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
-/// The OSC 7501 sequence that records `{lead, task}` as the block's `meta` record.
+/// The OSC 7501 sequence that records `{lead, task, cwd}` as the block's `meta`
+/// record. `cwd` is left out when unknown.
 ///
 /// Uses `idle` so the record never changes the block's visible state, and ST
 /// (`ESC \`) as the terminator.
-pub fn meta_record(lead: &str, task: Option<&str>) -> Vec<u8> {
-    let json = serde_json::json!({ "lead": lead, "task": task }).to_string();
+pub fn meta_record(lead: &str, task: Option<&str>, cwd: Option<&str>) -> Vec<u8> {
+    let mut v = serde_json::json!({ "lead": lead, "task": task });
+    if let Some(cwd) = cwd {
+        v["cwd"] = cwd.into();
+    }
+    let json = v.to_string();
     let msg = STANDARD.encode(json);
     format!("\x1b]7501;state=idle:id=meta:app=rexlead:msg={msg}\x1b\\").into_bytes()
 }
@@ -33,7 +38,12 @@ pub fn run(lead: &str, task: Option<&str>, cmd: &[OsString]) -> Result<()> {
     let Some((program, args)) = cmd.split_first() else {
         bail!("tag needs a command after --");
     };
-    let record = meta_record(lead, task);
+    // Absolute and canonical, so it matches the paths the worker's tools print.
+    let cwd = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .ok()
+        .and_then(|d| d.to_str().map(str::to_owned));
+    let record = meta_record(lead, task, cwd.as_deref());
     let wrote = OpenOptions::new()
         .write(true)
         .open("/dev/tty")
@@ -63,7 +73,7 @@ mod tests {
     fn exact_bytes() {
         // base64 of {"lead":"L","task":"t"}
         assert_eq!(
-            meta_record("L", Some("t")),
+            meta_record("L", Some("t"), None),
             b"\x1b]7501;state=idle:id=meta:app=rexlead:msg=eyJsZWFkIjoiTCIsInRhc2siOiJ0In0=\x1b\\"
         );
     }
@@ -71,7 +81,7 @@ mod tests {
     #[test]
     fn task_is_null_when_absent() {
         assert_eq!(
-            decode(&meta_record("block:1", None)),
+            decode(&meta_record("block:1", None, None)),
             serde_json::json!({ "lead": "block:1", "task": null })
         );
     }
@@ -79,8 +89,15 @@ mod tests {
     #[test]
     fn quotes_newlines_and_colons_survive() {
         let task = "fix \"login\"\nredirect: a=b; c";
-        let v = decode(&meta_record("block:01a1", Some(task)));
+        let v = decode(&meta_record("block:01a1", Some(task), None));
         assert_eq!(v["task"], task);
         assert_eq!(v["lead"], "block:01a1");
+    }
+
+    #[test]
+    fn cwd_round_trips_and_is_left_out_when_unknown() {
+        let v = decode(&meta_record("L", Some("t"), Some("/home/u/proj")));
+        assert_eq!(v["cwd"], "/home/u/proj");
+        assert!(decode(&meta_record("L", None, None)).get("cwd").is_none());
     }
 }
