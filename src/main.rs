@@ -60,7 +60,10 @@ fn run(cli: Cli) -> Result<()> {
             };
             let path = std::env::var_os("PATH");
             let out = launch::spawn(&rex::Cli::new(), &session, &spec, &exe, path.as_ref())?;
-            println!("{out}");
+            println!("{}", out.json);
+            if let Some(err) = out.open_error {
+                eprintln!("rexroster: the worker started, but the roster didn't open: {err}");
+            }
             Ok(())
         }
         Some(Command::Tag { lead, task, cmd }) => tag::run(&lead, task.as_deref(), &cmd),

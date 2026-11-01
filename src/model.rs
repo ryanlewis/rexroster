@@ -71,11 +71,22 @@ struct Block {
     records: HashMap<String, Record>,
     /// When the root record last changed state, in Unix seconds.
     since: Option<u64>,
+    /// When a `block_created` event announced it, in Unix seconds.
+    created: Option<u64>,
+    /// Whether its records have been fetched (or it was seen before the roster started).
+    fetched: bool,
 }
 
 impl Block {
     fn meta(&self) -> Option<Meta> {
         Meta::from_record(self.records.get("meta")?)
+    }
+
+    fn remove_record(&mut self, id: &str) {
+        self.records.remove(id);
+        if id.is_empty() {
+            self.since = None;
+        }
     }
 
     fn set_record(&mut self, id: String, record: Record, now: u64) {
@@ -142,9 +153,11 @@ impl Model {
             return Needs::default();
         }
         let needs = match event {
-            Event::BlockCreated(_) | Event::BlockChanged(_) | Event::ViewChanged => {
+            Event::BlockCreated(block) => {
+                self.blocks.entry(block).or_default().created = Some(now);
                 Needs { blocks: true }
             }
+            Event::BlockChanged(_) | Event::ViewChanged => Needs { blocks: true },
             Event::BlockClosed(block) => {
                 self.blocks.remove(&block);
                 Needs::default()
@@ -158,7 +171,7 @@ impl Model {
             }
             Event::StatusRemoved { block, id } => {
                 if let Some(b) = self.blocks.get_mut(&block) {
-                    b.records.remove(&id);
+                    b.remove_record(&id);
                 }
                 Needs::default()
             }
@@ -177,10 +190,11 @@ impl Model {
             if self.ignored(&info.id) {
                 continue;
             }
-            let block = self.blocks.entry(info.id.clone()).or_insert_with(|| {
+            let block = self.blocks.entry(info.id.clone()).or_default();
+            if !block.fetched {
+                block.fetched = true;
                 fresh.push(info.id.clone());
-                Block::default()
-            });
+            }
             block.label = info.label;
             block.placed = info.placed;
         }
@@ -241,10 +255,17 @@ impl Model {
     }
 
     /// The roster is done once it has had workers and has none left, or when
-    /// it never got one within the startup grace.
+    /// it never got one within the startup grace. A block created within the
+    /// grace that hasn't sent a meta record yet may be a worker still starting,
+    /// so it keeps the roster open.
     pub fn should_exit(&self, now: u64) -> bool {
         if self.had_workers {
-            self.workers().next().is_none()
+            let starting = self.blocks.values().any(|b| {
+                b.meta().is_none()
+                    && b.created
+                        .is_some_and(|t| now.saturating_sub(t) < STARTUP_GRACE_SECS)
+            });
+            self.workers().next().is_none() && !starting
         } else {
             now.saturating_sub(self.started) >= STARTUP_GRACE_SECS
         }
@@ -291,7 +312,7 @@ mod tests {
     use crate::rex::fake::Fake;
     use serde_json::json;
 
-    const LEAD: &str = "block:01a196c9-510e-754b-9fac-c08f575f61f0";
+    const LEAD: &str = "block:lead";
     /// When the worker's first record landed in the fixture.
     const T0: u64 = 1_793_531_152;
 
@@ -520,8 +541,8 @@ mod tests {
 
     #[test]
     fn replays_five_workers_spawned_and_closed() {
-        let lead = "block:01a196d0-9f6b-731c-967a-f903c70a08fc";
-        let roster = "block:01a196d0-d38e-7975-a2d4-19c9b716e2d0";
+        let lead = "block:lead";
+        let roster = "block:roster";
         let mut m = Model::new(lead.into(), Some(roster.into()), T0);
         let mut most = 0;
         let mut last_listed = 0;
@@ -546,5 +567,45 @@ mod tests {
         assert_eq!(first_exit, Some(last_listed + 1));
         assert!(m.rows(T0).is_empty());
         assert!(m.should_exit(T0));
+    }
+
+    #[test]
+    fn stays_open_for_a_spawned_worker_that_has_not_tagged_itself_yet() {
+        // Review finding: A is listed, B is spawned (open sees the roster and
+        // returns null), A closes before B's meta lands.
+        let mut m = Model::new(LEAD.into(), None, 0);
+        m.apply(meta("block:a", LEAD, None), 0);
+        m.apply(Event::BlockCreated("block:b".into()), 10);
+        m.apply(Event::BlockClosed("block:a".into()), 11);
+        assert!(!m.should_exit(11));
+        m.apply(meta("block:b", LEAD, None), 12);
+        assert_eq!(m.rows(12).len(), 1);
+    }
+
+    #[test]
+    fn an_untagged_new_block_holds_the_roster_only_for_the_grace() {
+        let mut m = Model::new(LEAD.into(), None, 0);
+        m.apply(meta("block:a", LEAD, None), 0);
+        m.apply(Event::BlockCreated("block:shell".into()), 10);
+        m.apply(Event::BlockClosed("block:a".into()), 11);
+        assert!(!m.should_exit(10 + STARTUP_GRACE_SECS - 1));
+        assert!(m.should_exit(10 + STARTUP_GRACE_SECS));
+    }
+
+    #[test]
+    fn removing_the_root_record_clears_the_age() {
+        let mut m = Model::new(LEAD.into(), None, 0);
+        m.apply(meta("block:a", LEAD, None), 0);
+        m.apply(status("block:a", "", "claude-code", "working", None), 0);
+        m.apply(
+            Event::StatusRemoved {
+                block: "block:a".into(),
+                id: String::new(),
+            },
+            600,
+        );
+        let row = &m.rows(600)[0];
+        assert_eq!(row.state, "starting");
+        assert_eq!(row.age, None);
     }
 }

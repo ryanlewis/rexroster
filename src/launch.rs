@@ -80,14 +80,21 @@ pub struct Spawn<'a> {
     pub cmd: &'a [OsString],
 }
 
-/// Start a detached worker block, then open the roster. Returns the contract's JSON line.
+pub struct Spawned {
+    /// The contract's JSON line: `{"block_id":…,"roster_layer_id":…}`.
+    pub json: Value,
+    /// Why the roster couldn't be opened. The worker is running regardless.
+    pub open_error: Option<String>,
+}
+
+/// Start a detached worker block, then open the roster.
 pub fn spawn(
     rex: &dyn Rex,
     session: &str,
     spec: &Spawn,
     exe: &Path,
     path: Option<&OsString>,
-) -> Result<Value> {
+) -> Result<Spawned> {
     let mut options = json!({
         // No shell: it would print a prompt, and Rex drops idle records at a
         // new prompt, which would lose the meta record.
@@ -119,8 +126,15 @@ pub fn spawn(
     let block = out["block_id"]
         .as_str()
         .context("session.new_block returned no block id")?;
-    let layer = open(rex, session, spec.lead, exe)?;
-    Ok(json!({ "block_id": block, "roster_layer_id": layer }))
+    // The block exists now, so its id must reach the caller even if open fails.
+    let (layer, open_error) = match open(rex, session, spec.lead, exe) {
+        Ok(layer) => (layer, None),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    Ok(Spawned {
+        json: json!({ "block_id": block, "roster_layer_id": layer }),
+        open_error,
+    })
 }
 
 fn utf8(s: &std::ffi::OsStr) -> Result<String> {
@@ -134,7 +148,7 @@ mod tests {
     use super::*;
     use crate::rex::fake::Fake;
 
-    const LEAD: &str = "block:01a196c9-510e-754b-9fac-c08f575f61f0";
+    const LEAD: &str = "block:0000-lead-a1b2c3";
 
     fn view() -> Value {
         json!({"windows": [{"window_id": "window:w", "layers": [
@@ -144,7 +158,7 @@ mod tests {
 
     #[test]
     fn label_uses_the_last_six_characters() {
-        assert_eq!(roster_label(LEAD), "roster-5f61f0");
+        assert_eq!(roster_label(LEAD), "roster-a1b2c3");
         assert_eq!(roster_label("abc"), "roster-abc");
     }
 
@@ -161,7 +175,7 @@ mod tests {
         assert_eq!(p["bounds"], json!(ROSTER_BOUNDS));
         assert_eq!(p["focus"], false);
         let block = &p["layout"]["block"];
-        assert_eq!(block["label"], "roster-5f61f0");
+        assert_eq!(block["label"], "roster-a1b2c3");
         assert_eq!(
             block["options"]["command"],
             json!(["/bin/rexroster", "--lead", LEAD])
@@ -173,7 +187,7 @@ mod tests {
         let rex = Fake::default();
         rex.on(
             "session.list_blocks",
-            json!({"blocks": [{"block_id": "block:r", "label": "roster-5f61f0", "placement": "placed"}]}),
+            json!({"blocks": [{"block_id": "block:r", "label": "roster-a1b2c3", "placement": "placed"}]}),
         );
         assert_eq!(open(&rex, "s", LEAD, Path::new("/x")).unwrap(), None);
         assert_eq!(rex.methods(), ["session.list_blocks"]);
@@ -210,7 +224,9 @@ mod tests {
             cmd: &cmd,
         };
         let path = OsString::from("/opt/bin:/usr/bin");
-        let out = spawn(&rex, "s", &spec, Path::new("/bin/rr"), Some(&path)).unwrap();
+        let out = spawn(&rex, "s", &spec, Path::new("/bin/rr"), Some(&path))
+            .unwrap()
+            .json;
         assert_eq!(
             out,
             json!({"block_id": "block:w", "roster_layer_id": "layer:r"})
@@ -236,7 +252,7 @@ mod tests {
         rex.on("session.new_block", json!({"block_id": "block:w"}));
         rex.on(
             "session.list_blocks",
-            json!({"blocks": [{"block_id": "block:r", "label": "roster-5f61f0"}]}),
+            json!({"blocks": [{"block_id": "block:r", "label": "roster-a1b2c3"}]}),
         );
         let spec = Spawn {
             lead: LEAD,
@@ -246,11 +262,38 @@ mod tests {
             cmd: &["true".into()],
         };
         let out = spawn(&rex, "s", &spec, Path::new("/bin/rr"), None).unwrap();
-        assert_eq!(out, json!({"block_id": "block:w", "roster_layer_id": null}));
+        assert_eq!(
+            out.json,
+            json!({"block_id": "block:w", "roster_layer_id": null})
+        );
+        assert!(out.open_error.is_none());
         assert!(
             rex.params("session.new_block")[0]["options"]
                 .get("cwd")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn spawn_still_reports_the_block_when_open_fails() {
+        // Review finding: the lead is not in a window, so open fails after
+        // the worker block already exists.
+        let rex = Fake::default();
+        rex.on("session.new_block", json!({"block_id": "block:w"}));
+        rex.on("session.list_blocks", json!({"blocks": []}));
+        rex.on("session.view", json!({"windows": []}));
+        let spec = Spawn {
+            lead: LEAD,
+            name: "w",
+            task: None,
+            cwd: None,
+            cmd: &["true".into()],
+        };
+        let out = spawn(&rex, "s", &spec, Path::new("/bin/rr"), None).unwrap();
+        assert_eq!(
+            out.json,
+            json!({"block_id": "block:w", "roster_layer_id": null})
+        );
+        assert!(out.open_error.unwrap().contains("not in a window"));
     }
 }

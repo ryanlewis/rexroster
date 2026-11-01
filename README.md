@@ -53,11 +53,10 @@ The roster lists a block only when this record names its own lead.
 
 Each row shows:
 
-- a state glyph: `●` working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
+- a glyph for the state of the worker's root status record (the one Claude Code reports): a turning braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) while working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
 - `▸` if the worker is shown
 - the label
-- the state from the worker's root status record (Claude Code's)
-- the time in that state
+- the time in the current state
 - the record's message, or the task when there is no message
 
 | Key | Action |
@@ -69,7 +68,9 @@ Each row shows:
 
 The layer's height follows the number of workers. If the roster never gets a worker, it exits after 30 seconds.
 
-Focus key: `cmd+alt+R` (physical key `KeyR`, action `roster_toggle`) switches focus between the lead and its roster. It is bound in `~/.config/rex/init.lua`, which chezmoi manages. Run `rex config reload` after `chezmoi apply`.
+The spinner redraws every 100 ms while any worker is working. Otherwise the roster wakes once a second to update the times.
+
+Focus key: `cmd+alt+R` (physical key `KeyR`, action `roster_toggle`) switches focus between the lead and its roster. The binding lives in Rex's `init.lua`. After you change that file, for example with a dotfiles tool such as chezmoi, run `rex config reload`.
 
 ## Development
 
