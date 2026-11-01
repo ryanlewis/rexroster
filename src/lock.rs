@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn refuses_a_lock_dir_others_can_use() {
-        // Review finding: a pre-made world-writable dir was used as is.
+        // A pre-made world-writable dir must not be used as is.
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("open-dir");
         std::fs::create_dir_all(&dir).unwrap();

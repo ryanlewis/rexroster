@@ -101,7 +101,7 @@ pub struct Spawn<'a> {
 }
 
 pub struct Spawned {
-    /// The contract's JSON line: `{"block_id":…,"roster_layer_id":…}`.
+    /// The JSON line spawn prints: `{"block_id":…,"roster_layer_id":…}`.
     pub json: Value,
     /// Why the roster couldn't be opened. The worker is running regardless.
     pub open_error: Option<String>,
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn spawn_still_reports_the_block_when_open_fails() {
-        // Review finding: the lead is not in a window, so open fails after
+        // The lead is not in a window, so open fails after
         // the worker block already exists.
         let rex = Fake::default();
         rex.on("session.new_block", json!({"block_id": "block:w"}));

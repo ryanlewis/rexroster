@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn top_level_display_flags_reach_open_or_are_refused() {
-        // Review finding: `rexroster --view expanded open L` ignored the flag.
+        // `rexroster --view expanded open L` must not ignore the flag.
         let cli = Cli::try_parse_from(["rexroster", "--view", "expanded", "open", "L"]).unwrap();
         let flags = cli.subcommand_display().unwrap();
         assert_eq!(flags.to_args(), ["--view", "expanded"]);
