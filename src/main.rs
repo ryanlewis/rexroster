@@ -26,6 +26,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let display = cli.subcommand_display()?;
     let session = std::env::var("REX_SESSION")
         .ok()
         .filter(|s| !s.is_empty())
@@ -37,10 +38,10 @@ fn run(cli: Cli) -> Result<()> {
                 .context("no lead: pass --lead <block-id> or set REXROSTER_LEAD")?;
             let path = config::path();
             let (file, error) = config::load(path.as_deref());
-            let opts = file.with_flags(cli.display.border, cli.display.view);
+            let opts = file.with_flags(display.border, display.view);
             tui::run(lead, session, tui::Settings { opts, path, error })
         }
-        Some(Command::Open { lead, display }) => {
+        Some(Command::Open { lead, .. }) => {
             let exe = std::env::current_exe().context("finding rexroster's own path")?;
             let flags = display.to_args();
             if let Some(layer) = launch::open(&rex::Cli::new(), &session, &lead, &exe, &flags)? {

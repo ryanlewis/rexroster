@@ -202,7 +202,15 @@ pub fn save(path: &Path, opts: &Options, keys: &[Key]) -> Result<()> {
         bail!("{} is not valid TOML, so it was not saved", path.display());
     };
     for key in keys {
-        doc[key.name()] = value(opts.value(*key));
+        let mut new = value(opts.value(*key));
+        // Keep any comment or spacing around the old value.
+        if let (Some(old), Some(v)) = (
+            doc.get(key.name()).and_then(|i| i.as_value()),
+            new.as_value_mut(),
+        ) {
+            *v.decor_mut() = old.decor().clone();
+        }
+        doc[key.name()] = new;
     }
     let dir = path.parent().context("config path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -366,5 +374,24 @@ mod tests {
             Some(PathBuf::from("/home/u/.config/rexroster/config.toml"))
         );
         assert_eq!(p(None, None), None);
+    }
+
+    #[test]
+    fn save_keeps_a_comment_on_the_changed_key() {
+        // Review finding: the trailing comment was dropped.
+        let dir = temp_dir("comment");
+        let file = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "border = \"none\"  # keep it clean\n").unwrap();
+        let opts = Options {
+            border: Border::Rounded,
+            ..Options::default()
+        };
+        save(&file, &opts, &[Key::Border]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "border = \"rounded\"  # keep it clean\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

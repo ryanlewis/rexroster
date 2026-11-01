@@ -19,6 +19,18 @@ pub struct Display {
 }
 
 impl Display {
+    /// These flags, falling back to `other` for any not given.
+    pub fn or(self, other: Display) -> Display {
+        Display {
+            border: self.border.or(other.border),
+            view: self.view.or(other.view),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.border.is_none() && self.view.is_none()
+    }
+
     /// The flags again, to pass on to another rexroster command.
     pub fn to_args(self) -> Vec<String> {
         let mut args = Vec::new();
@@ -44,6 +56,21 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    /// The display flags for a subcommand. Flags given before `open` apply
+    /// to it (its own win); before `spawn` or `tag` they have no meaning, so
+    /// they are an error rather than silently ignored.
+    pub fn subcommand_display(&self) -> anyhow::Result<Display> {
+        match &self.command {
+            Some(Command::Open { display, .. }) => Ok(display.or(self.display)),
+            Some(_) if !self.display.is_empty() => {
+                anyhow::bail!("--border and --view only apply to the roster and to open")
+            }
+            _ => Ok(self.display),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -136,5 +163,30 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(Cli::try_parse_from(["rexroster", "--border", "square"]).is_err());
+    }
+
+    #[test]
+    fn top_level_display_flags_reach_open_or_are_refused() {
+        // Review finding: `rexroster --view expanded open L` ignored the flag.
+        let cli = Cli::try_parse_from(["rexroster", "--view", "expanded", "open", "L"]).unwrap();
+        let flags = cli.subcommand_display().unwrap();
+        assert_eq!(flags.to_args(), ["--view", "expanded"]);
+        let cli = Cli::try_parse_from([
+            "rexroster",
+            "--border",
+            "none",
+            "open",
+            "L",
+            "--border",
+            "rounded",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.subcommand_display().unwrap().to_args(),
+            ["--border", "rounded"]
+        );
+        let cli = Cli::try_parse_from(["rexroster", "--border", "rounded", "tag", "L", "--", "x"])
+            .unwrap();
+        assert!(cli.subcommand_display().is_err());
     }
 }
