@@ -305,8 +305,13 @@ impl Model {
             .map(|(id, b)| {
                 let root = b.records.get("");
                 let meta = b.meta();
-                let task = meta.as_ref().and_then(|m| m.task.clone());
-                let cwd = meta.and_then(|m| m.cwd);
+                let cwd = meta.as_ref().and_then(|m| m.cwd.clone());
+                // The task gets the same rewrite as the message, so the
+                // expanded view still sees them as equal and shows one.
+                let task = meta.and_then(|m| m.task).map(|t| match &cwd {
+                    Some(cwd) => strip_cwd(&t, cwd),
+                    None => t,
+                });
                 Row {
                     block: id.clone(),
                     label: b.label.clone(),
@@ -318,8 +323,8 @@ impl Model {
                             .and_then(|r| r.msg.clone())
                             .or_else(|| task.clone())
                             .unwrap_or_default();
-                        match cwd {
-                            Some(cwd) => strip_cwd(&msg, &cwd),
+                        match &cwd {
+                            Some(cwd) => strip_cwd(&msg, cwd),
                             None => msg,
                         }
                     },
@@ -487,6 +492,17 @@ mod tests {
         let msg = |b: &str| rows.iter().find(|r| r.block == b).unwrap().msg.clone();
         assert_eq!(msg("block:a"), "Running ls");
         assert_eq!(msg("block:b"), text);
+        // A task that is the fallback message stays equal to it.
+        let t = format!("cd {CWD} && cargo test");
+        let with = json!({ "lead": LEAD, "task": t, "cwd": CWD }).to_string();
+        m.apply(status("block:c", "meta", "rexlead", "idle", Some(&with)), 0);
+        let row = m
+            .rows(0)
+            .into_iter()
+            .find(|r| r.block == "block:c")
+            .unwrap();
+        assert_eq!(row.msg, "cargo test");
+        assert_eq!(row.task.as_deref(), Some("cargo test"));
     }
 
     #[test]
