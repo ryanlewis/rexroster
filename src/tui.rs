@@ -133,6 +133,8 @@ pub fn run(lead: String, session: String) -> Result<()> {
             let mut terminal = ratatui::init();
             let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
             spawn_input(input_tx);
+            // A worker minimized before the roster started gets no view event.
+            app.hide_minimized();
             let result = app.run(&mut terminal, &rx);
             let _ = execute!(std::io::stdout(), DisableFocusChange, DisableMouseCapture);
             ratatui::restore();
@@ -187,9 +189,14 @@ impl App<'_> {
         }
     }
 
+    /// The last line shows key hints while focused, and an error whenever there is one.
+    fn footer_shown(&self) -> bool {
+        self.focused || self.error.is_some()
+    }
+
     /// Note the rows the pane needs: the workers' lines, plus the footer while focused.
     fn note_rows(&mut self, lines: usize) {
-        let want = size::wanted_rows(lines, self.focused);
+        let want = size::wanted_rows(lines, self.footer_shown());
         if want != self.fit.want {
             self.fit = Fit {
                 dirty: true,
@@ -394,7 +401,7 @@ impl App<'_> {
 
     fn draw(&mut self, f: &mut ratatui::Frame, rows: &[Row]) {
         let area = f.area();
-        let footer = u16::from(self.focused && area.height > 0);
+        let footer = u16::from(self.footer_shown() && area.height > 0);
         let list = Rect {
             height: area.height - footer,
             ..area
@@ -410,11 +417,15 @@ impl App<'_> {
             self.expanded,
         );
         let visible = usize::from(list.height);
-        // Keep the whole selected worker on screen when the list is taller than the pane.
+        // Keep the selected worker on screen when the list is taller than the
+        // pane; one taller than the pane shows from its header down.
+        let start = sel
+            .and_then(|i| laid.iter().position(|(o, _)| *o == i))
+            .unwrap_or(0);
         let end = sel.map_or(0, |i| {
             laid.iter().rposition(|(o, _)| *o == i).map_or(0, |l| l + 1)
         });
-        self.offset = end.saturating_sub(visible);
+        self.offset = end.saturating_sub(visible).min(start);
         self.line_owner = laid.iter().map(|(o, _)| *o).collect();
         let lines: Vec<Line> = laid
             .into_iter()
@@ -1207,5 +1218,37 @@ mod tests {
         assert!(a.fit.dirty);
         a.fit_layer();
         assert_eq!(rex.params("session.resize_layer").len(), 2);
+    }
+
+    #[test]
+    fn errors_show_even_without_focus() {
+        // Review finding: a background refresh fails while a worker has focus.
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.error = Some("calling session.view: boom".into());
+        let rows = [worker("alpha", "idle", false, Some(5), "hi")];
+        let screen = render_at(&mut a, &rows, 40, 2);
+        assert!(screen.contains("boom"), "{screen}");
+        // And the height makes room for it.
+        a.note_rows(1);
+        assert_eq!(a.fit.want, 2);
+    }
+
+    #[test]
+    fn a_tall_selected_worker_keeps_its_header_on_screen() {
+        // Review finding: a 5-line worker in a 3-line pane.
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.expanded = true;
+        let rows = [
+            tasked("alpha", "one", None),
+            tasked("beta", &"word ".repeat(40), Some("task")),
+        ];
+        a.selected = Some("block:beta".into());
+        let screen = render_at(&mut a, &rows, 24, 3);
+        assert!(
+            screen.lines().next().unwrap().starts_with("›◐ beta"),
+            "{screen}"
+        );
     }
 }
