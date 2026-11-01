@@ -84,7 +84,10 @@ fn block_event(block: String, payload: &Value) -> Option<Event> {
 }
 
 /// Start `rex events` and send each parsed event, then `None` when the stream ends.
-pub fn spawn(cli: &rex::Cli, session: &str, tx: Sender<Option<Event>>) -> Result<Child> {
+pub fn spawn<T>(cli: &rex::Cli, session: &str, tx: Sender<T>) -> Result<Child>
+where
+    T: From<Option<Event>> + Send + 'static,
+{
     let mut child = cli
         .command()
         .args(["events", "-s", session, "--json"])
@@ -98,12 +101,12 @@ pub fn spawn(cli: &rex::Cli, session: &str, tx: Sender<Option<Event>>) -> Result
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             if let Some(event) = parse(&line)
-                && tx.send(Some(event)).is_err()
+                && tx.send(Some(event).into()).is_err()
             {
                 return;
             }
         }
-        let _ = tx.send(None);
+        let _ = tx.send(None.into());
     });
     Ok(child)
 }
