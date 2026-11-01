@@ -1229,6 +1229,7 @@ dependencies = [
  "clap",
  "ratatui",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

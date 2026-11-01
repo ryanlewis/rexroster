@@ -51,22 +51,30 @@ The roster lists a block only when this record names its own lead.
 
 ## The roster
 
-Each row shows:
+The roster has no frame or title; Rex's pane title already names it. In the compact view (the default) each worker takes one line:
 
+- `›` on the selected worker
 - a glyph for the state of the worker's root status record (the one Claude Code reports): a turning braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) while working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
 - `▸` if the worker is shown
-- the label
+- the label, in a column as wide as the longest label (6 to 20 characters)
 - the time in the current state
-- the record's message, or the task when there is no message
+- the record's message, or the task when there is no message, cut with `…` to fit
+
+Press `v` for the expanded view. Each worker then has a line with its label and time, then its message wrapped to the pane width (at most 3 lines), then its task in dim text if that differs from the message.
 
 | Key | Action |
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | Move the selection |
 | `Enter`, double-click | Show the worker as a centred float beside the lead and focus it. On a shown worker, hide it again |
+| `v` | Switch between the compact and expanded views |
 | `l` | Focus the lead |
 | `q`, `Ctrl-C` | Quit |
 
-The layer's height follows the number of workers. If the roster never gets a worker, it exits after 30 seconds.
+A line of key hints shows at the bottom while the roster has focus.
+
+To hide a shown worker, press `Enter` on it or minimize its pane: the roster turns a minimized worker back into a hidden one. Closing a worker's pane ends the worker.
+
+The layer's height follows the lines the workers take, plus the hints line while focused. If the roster never gets a worker, it exits after 30 seconds.
 
 The spinner redraws every 100 ms while any worker is working. Otherwise the roster wakes once a second to update the times.
 
