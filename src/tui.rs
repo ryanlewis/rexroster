@@ -49,6 +49,8 @@ struct App<'a> {
     last_click: Option<(usize, Instant)>,
     error: Option<String>,
     fit: Fit,
+    /// When the spinner started; its frame is a function of the time since.
+    spin_start: Instant,
 }
 
 #[derive(Default)]
@@ -75,14 +77,20 @@ pub fn run(lead: String, session: String) -> Result<()> {
         last_click: None,
         error: None,
         fit: Fit::default(),
+        spin_start: Instant::now(),
     };
-    app.model.refresh(app.rex, &app.session, now())?;
-
-    let mut terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let result = app.run(&mut terminal, &rx);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-    ratatui::restore();
+    let result = app
+        .model
+        .refresh(app.rex, &app.session, now())
+        .and_then(|()| {
+            let mut terminal = ratatui::init();
+            let _ = execute!(std::io::stdout(), EnableMouseCapture);
+            let result = app.run(&mut terminal, &rx);
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            ratatui::restore();
+            result
+        });
+    // Stop the event stream however the roster ends.
     let _ = child.kill();
     let _ = child.wait();
     result
@@ -113,7 +121,7 @@ impl App<'_> {
             }
             terminal.draw(|f| self.draw(f, &rows))?;
 
-            if event::poll(Duration::from_millis(250))? {
+            if event::poll(tick(&rows))? {
                 let quit = self.on_terminal_event(&event::read()?, &rows);
                 if quit {
                     return Ok(());
@@ -309,7 +317,8 @@ impl App<'_> {
         let area = f.area();
         self.table_area = block.inner(area);
         self.table.select(self.selected_index(rows));
-        let table = Table::new(rows.iter().map(table_row), WIDTHS)
+        let elapsed = self.spin_start.elapsed();
+        let table = Table::new(rows.iter().map(|r| table_row(r, elapsed)), WIDTHS)
             .block(block)
             .column_spacing(1)
             .highlight_symbol("›")
@@ -318,18 +327,41 @@ impl App<'_> {
     }
 }
 
-const WIDTHS: [Constraint; 5] = [
+const WIDTHS: [Constraint; 4] = [
     Constraint::Length(2),
-    Constraint::Max(14),
-    Constraint::Length(8),
+    Constraint::Max(20),
     Constraint::Length(3),
     Constraint::Fill(1),
 ];
 
-/// A state's glyph and colour.
-pub fn glyph(state: &str) -> (&'static str, Style) {
+/// The `working` glyph: braille dots turning clockwise, one frame per `SPIN_TICK`.
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const SPIN_TICK: Duration = Duration::from_millis(100);
+/// How often an idle roster wakes, to keep the time-in-state column current.
+pub const IDLE_TICK: Duration = Duration::from_secs(1);
+
+/// The spinner frame for a time since the spinner started.
+pub fn spinner_frame(elapsed: Duration) -> &'static str {
+    let step = elapsed.as_millis() / SPIN_TICK.as_millis();
+    // `% len` keeps the index small, so the conversion can't fail.
+    let i = usize::try_from(step % SPINNER.len() as u128).unwrap_or(0);
+    SPINNER[i]
+}
+
+/// How long the loop waits for input before redrawing: the spinner's tick
+/// while any worker is working, otherwise the slow idle tick.
+pub fn tick(rows: &[Row]) -> Duration {
+    if rows.iter().any(|r| r.state == "working") {
+        SPIN_TICK
+    } else {
+        IDLE_TICK
+    }
+}
+
+/// A state's glyph and colour. `elapsed` drives the `working` spinner.
+pub fn glyph(state: &str, elapsed: Duration) -> (&'static str, Style) {
     match state {
-        "working" => ("●", Style::new().fg(Color::Yellow)),
+        "working" => (spinner_frame(elapsed), Style::new().fg(Color::Yellow)),
         "blocked" => ("◐", Style::new().fg(Color::Red)),
         "done" => ("✓", Style::new().fg(Color::Green)),
         "error" => ("✗", Style::new().fg(Color::Red)),
@@ -338,8 +370,8 @@ pub fn glyph(state: &str) -> (&'static str, Style) {
     }
 }
 
-fn table_row(r: &Row) -> TableRow<'_> {
-    let (g, style) = glyph(&r.state);
+fn table_row(r: &Row, elapsed: Duration) -> TableRow<'_> {
+    let (g, style) = glyph(&r.state, elapsed);
     let dim = Style::new().add_modifier(Modifier::DIM);
     TableRow::new([
         Cell::from(Line::from(vec![
@@ -347,7 +379,6 @@ fn table_row(r: &Row) -> TableRow<'_> {
             Span::raw(if r.shown { "▸" } else { " " }),
         ])),
         Cell::from(r.label.as_str()),
-        Cell::from(Span::styled(r.state.as_str(), dim)),
         Cell::from(Span::styled(r.age.map(short_age).unwrap_or_default(), dim)),
         Cell::from(r.msg.as_str()),
     ])
@@ -383,6 +414,7 @@ mod tests {
             last_click: None,
             error: None,
             fit: Fit::default(),
+            spin_start: Instant::now(),
         }
     }
 
@@ -401,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn draws_rows_with_glyph_marker_state_age_and_msg() {
+    fn draws_rows_with_glyph_marker_age_and_msg() {
         let rex = Fake::default();
         let mut a = app(&rex);
         let rows = [
@@ -412,12 +444,10 @@ mod tests {
         let screen = render(&mut a, &rows);
         let lines: Vec<&str> = screen.lines().collect();
         assert!(lines[0].contains("workers"));
-        assert!(lines[1].contains("›●▸ alpha"), "{}", lines[1]);
-        assert!(
-            lines[1].contains("working  1m  Running tests"),
-            "{}",
-            lines[1]
-        );
+        // Rendered within the first spinner tick, so frame 0.
+        assert!(lines[1].contains("›⠋▸ alpha"), "{}", lines[1]);
+        assert!(lines[1].contains(" 1m  Running tests"), "{}", lines[1]);
+        assert!(!lines[1].contains("working"), "{}", lines[1]);
         assert!(lines[2].contains(" ✓  beta"), "{}", lines[2]);
         assert!(lines[3].contains(" ◐  gamma"), "{}", lines[3]);
         assert!(lines[4].contains("l lead"), "{}", lines[4]);
@@ -569,5 +599,59 @@ mod tests {
             rex.params("session.resize_layer").len(),
             usize::from(MAX_FITS)
         );
+    }
+
+    #[test]
+    fn spinner_frame_follows_elapsed_time() {
+        let ms = Duration::from_millis;
+        assert_eq!(spinner_frame(ms(0)), "⠋");
+        assert_eq!(spinner_frame(ms(99)), "⠋");
+        assert_eq!(spinner_frame(ms(100)), "⠙");
+        assert_eq!(spinner_frame(ms(950)), "⠏");
+        // Wraps after the last frame.
+        assert_eq!(spinner_frame(ms(1000)), "⠋");
+        assert_eq!(spinner_frame(ms(1_234_567)), SPINNER[5]);
+        // Only `working` spins.
+        assert_eq!(glyph("working", ms(300)).0, "⠸");
+        assert_eq!(glyph("blocked", ms(300)).0, "◐");
+        assert_eq!(glyph("blocked", ms(700)).0, "◐");
+    }
+
+    #[test]
+    fn ticks_fast_only_while_a_worker_is_working() {
+        assert_eq!(tick(&[]), IDLE_TICK);
+        let idle = [
+            row("block:1", "a", "idle", false),
+            row("block:2", "b", "done", false),
+        ];
+        assert_eq!(tick(&idle), IDLE_TICK);
+        let busy = [
+            row("block:1", "a", "idle", false),
+            row("block:2", "b", "working", false),
+        ];
+        assert_eq!(tick(&busy), SPIN_TICK);
+    }
+
+    #[test]
+    fn redrawing_a_spinner_frame_changes_only_that_cell() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let rows = [
+            row("block:1", "alpha", "working", false),
+            row("block:2", "beta", "done", false),
+        ];
+        let mut t = Terminal::new(TestBackend::new(52, 4)).unwrap();
+        t.draw(|f| a.draw(f, &rows)).unwrap();
+        let before = t.backend().buffer().clone();
+        a.spin_start -= SPIN_TICK;
+        t.draw(|f| a.draw(f, &rows)).unwrap();
+        let after = t.backend().buffer().clone();
+        let changed: Vec<_> = before
+            .diff(&after)
+            .into_iter()
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        // ratatui writes only the diff, so the frame is one cell: no flicker.
+        assert_eq!(changed, [(2, 1)]);
     }
 }

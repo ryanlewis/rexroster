@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn parses_a_worker_lifecycle() {
         let events = fixture("lifecycle.jsonl");
-        let worker = "block:01a196c9-86c1-74ed-b272-b3e6f444e875";
+        let worker = "block:w1";
         assert_eq!(events.first(), Some(&Event::BlockCreated(worker.into())));
         assert!(events.contains(&Event::BlockClosed(worker.into())));
 
