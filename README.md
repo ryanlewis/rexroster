@@ -26,8 +26,8 @@ Every command reads the session from `$REX_SESSION` and stops with an error if i
 
 | Command | What it does |
 | --- | --- |
-| `rexroster [--lead <block-id>]` | Runs the roster for a lead. `--lead` defaults to `$REXROSTER_LEAD`. |
-| `rexroster open <lead-block-id>` | Opens the lead's roster in a floating layer at the top right of the lead's tab, without focus, unless a block labelled `roster-<last 6 characters of the lead id>` already exists. Prints the new layer id, or nothing. Exits 0 in both cases. |
+| `rexroster [--lead <block-id>] [--border none\|rounded] [--view compact\|expanded]` | Runs the roster for a lead. `--lead` defaults to `$REXROSTER_LEAD`. `--border` and `--view` override the config file for this run. |
+| `rexroster open <lead-block-id> [--border …] [--view …]` | Opens the lead's roster in a floating layer at the top right of the lead's tab, without focus, unless a block labelled `roster-<last 6 characters of the lead id>` already exists. Prints the new layer id, or nothing. Exits 0 in both cases. Passes `--border` and `--view` on to the roster. |
 | `rexroster spawn <lead-block-id> <name> [--task <text>] [--cwd <dir>] -- <cmd> [args...]` | Starts a detached block labelled `<name>` that runs `rexroster tag <lead> [--task <text>] -- <cmd...>`, then does what `open` does. Prints `{"block_id":"…","roster_layer_id":"…"}`, where `roster_layer_id` is `null` if the roster was already open. |
 | `rexroster tag <lead-block-id> [--task <text>] -- <cmd> [args...]` | Marks the terminal as the lead's worker, then replaces itself with `<cmd>`. |
 
@@ -51,7 +51,7 @@ The roster lists a block only when this record names its own lead.
 
 ## The roster
 
-The roster has no frame or title; Rex's pane title already names it. In the compact view (the default) each worker takes one line:
+By default the roster has no frame or title, because Rex's pane title already names it. In the compact view (the default) each worker takes one line:
 
 - `›` on the selected worker
 - a glyph for the state of the worker's root status record (the one Claude Code reports): a turning braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) while working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
@@ -66,11 +66,12 @@ Press `v` for the expanded view. Each worker then has a line with its label and 
 | --- | --- |
 | `j` / `k`, `↓` / `↑` | Move the selection |
 | `Enter`, double-click | Show the worker as a centred float beside the lead and focus it. On a shown worker, hide it again |
-| `v` | Switch between the compact and expanded views |
+| `v` | Switch between the compact and expanded views (not saved) |
+| `o` | Open the options panel |
 | `l` | Focus the lead |
 | `q`, `Ctrl-C` | Quit |
 
-A line of key hints shows at the bottom while the roster has focus.
+A line of key hints shows at the bottom while the roster has focus. With a border, the hints sit on the bottom border instead.
 
 To hide a shown worker, press `Enter` on it or minimize its pane: the roster turns a minimized worker back into a hidden one. Closing a worker's pane ends the worker.
 
@@ -79,6 +80,25 @@ The layer's height follows the lines the workers take, plus the hints line while
 The spinner redraws every 100 ms while any worker is working. Otherwise the roster wakes once a second to update the times.
 
 Focus key: `cmd+alt+R` (physical key `KeyR`, action `roster_toggle`) switches focus between the lead and its roster. The binding lives in Rex's `init.lua`. After you change that file, for example with a dotfiles tool such as chezmoi, run `rex config reload`.
+
+## Options
+
+Options live in `$XDG_CONFIG_HOME/rexroster/config.toml`, or `~/.config/rexroster/config.toml` when `XDG_CONFIG_HOME` is not set:
+
+```toml
+border = "rounded"   # "none" (default) or "rounded": a box titled "workers"
+view = "expanded"    # "compact" (default) or "expanded": the view the roster starts in
+```
+
+A missing file or key means the default, and unknown keys are ignored. If the file can't be parsed, the roster shows one error line and uses the defaults. `--border` and `--view` on the command line win over the file.
+
+Press `o` to open the options panel in the roster:
+
+- `j`/`k` or the arrow keys move between options.
+- `Enter`, `Space`, `←` or `→` change the value, as does clicking an option. Changes apply straight away.
+- `Esc` or `o` closes the panel and saves the options you changed to the config file. Other keys and comments in the file are kept.
+
+The roster writes this file itself, so don't manage it with a dotfiles tool that would overwrite it.
 
 ## Development
 

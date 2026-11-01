@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod events;
 mod launch;
 mod model;
@@ -34,11 +35,15 @@ fn run(cli: Cli) -> Result<()> {
             let lead = cli
                 .lead
                 .context("no lead: pass --lead <block-id> or set REXROSTER_LEAD")?;
-            tui::run(lead, session)
+            let path = config::path();
+            let (file, error) = config::load(path.as_deref());
+            let opts = file.with_flags(cli.display.border, cli.display.view);
+            tui::run(lead, session, tui::Settings { opts, path, error })
         }
-        Some(Command::Open { lead }) => {
+        Some(Command::Open { lead, display }) => {
             let exe = std::env::current_exe().context("finding rexroster's own path")?;
-            if let Some(layer) = launch::open(&rex::Cli::new(), &session, &lead, &exe)? {
+            let flags = display.to_args();
+            if let Some(layer) = launch::open(&rex::Cli::new(), &session, &lead, &exe, &flags)? {
                 println!("{layer}");
             }
             Ok(())
