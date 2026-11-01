@@ -1,0 +1,32 @@
+{
+  "revision": 9,
+  "session_id": "session:s",
+  "windows": [
+    {
+      "window_id": "window:1",
+      "layers": [
+        {
+          "layer_id": "layer:tiled",
+          "kind": "tiled",
+          "bounds": [0, 0, 1, 1],
+          "layout": {
+            "rect": [0, 0, 1, 1],
+            "direction": "vertical",
+            "children": [
+              { "rect": [0, 0, 1, 0.5], "block_id": "block:lead" },
+              { "rect": [0, 0.5, 1, 0.5], "block_id": "block:other" }
+            ]
+          },
+          "blocks": [{ "block_id": "block:lead" }, { "block_id": "block:other" }]
+        },
+        {
+          "layer_id": "layer:float",
+          "kind": "floating",
+          "bounds": [0.72, 0.02, 0.27, 0.12],
+          "layout": { "rect": [0.72, 0.02, 0.27, 0.12], "block_id": "block:roster" },
+          "blocks": [{ "block_id": "block:roster" }]
+        }
+      ]
+    }
+  ]
+}

@@ -4,6 +4,7 @@
 //! program in a block can set records on it, so the worker's launcher sends it.
 
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -22,17 +23,25 @@ pub fn meta_record(lead: &str, task: Option<&str>) -> Vec<u8> {
     format!("\x1b]7501;state=idle:id=meta:app=rexlead:msg={msg}\x1b\\").into_bytes()
 }
 
-/// Write the meta record to stdout, then replace this process with `cmd`.
-/// Returns only on error.
+/// Write the meta record to the terminal, then replace this process with `cmd`.
+/// Returns only when `cmd` can't be run.
+///
+/// The record goes to `/dev/tty` when it can be opened, so it never ends up in
+/// a redirected stdout, and to stdout otherwise. Writing it is best-effort:
+/// the command runs whether or not the tag landed.
 pub fn run(lead: &str, task: Option<&str>, cmd: &[OsString]) -> Result<()> {
     let Some((program, args)) = cmd.split_first() else {
         bail!("tag needs a command after --");
     };
-    let mut out = std::io::stdout().lock();
-    out.write_all(&meta_record(lead, task))
-        .and_then(|()| out.flush())
-        .context("writing the meta record")?;
-    drop(out);
+    let record = meta_record(lead, task);
+    let wrote = OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .and_then(|mut tty| tty.write_all(&record).and_then(|()| tty.flush()));
+    if wrote.is_err() {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&record).and_then(|()| out.flush());
+    }
     let err = Command::new(program).args(args).exec();
     Err(err).with_context(|| format!("running {}", program.to_string_lossy()))
 }
