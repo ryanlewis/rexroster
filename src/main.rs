@@ -31,7 +31,7 @@ fn run(cli: Cli) -> Result<()> {
     let display = cli.subcommand_display()?;
     if let Some(Command::Watch) = cli.command {
         // The watcher hears every session, so it needs no REX_SESSION.
-        let (opts, _) = config::load(config::path().as_deref());
+        let opts = config::load_strict(config::path().as_deref())?;
         return watch::run(rex::Cli::new().command(), opts.notify, &watch::lock_path());
     }
     let session = std::env::var("REX_SESSION")
@@ -104,7 +104,13 @@ fn run(cli: Cli) -> Result<()> {
 /// Start the watcher in the background when the config wants one. A failure
 /// is a warning: the roster and the worker don't depend on it.
 fn start_watcher(exe: &std::path::Path) {
-    let (opts, _) = config::load(config::path().as_deref());
+    let opts = match config::load_strict(config::path().as_deref()) {
+        Ok(opts) => opts,
+        Err(err) => {
+            eprintln!("rexroster: not starting the watcher: {err:#}");
+            return;
+        }
+    };
     if !opts.watch {
         return;
     }
