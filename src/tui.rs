@@ -1564,7 +1564,7 @@ mod tests {
 
     #[test]
     fn errors_show_even_without_focus() {
-        // Review finding: a background refresh fails while a worker has focus.
+        // A background refresh fails while a worker has focus.
         let rex = Fake::default();
         let mut a = app(&rex);
         a.error = Some("calling session.view: boom".into());
@@ -1578,7 +1578,7 @@ mod tests {
 
     #[test]
     fn a_tall_selected_worker_keeps_its_header_on_screen() {
-        // Review finding: a 5-line worker in a 3-line pane.
+        // A 5-line worker in a 3-line pane.
         let rex = Fake::default();
         let mut a = app(&rex);
         a.opts.view = View::Expanded;
@@ -1748,7 +1748,7 @@ mod tests {
 
     #[test]
     fn cycling_the_view_away_and_back_keeps_the_current_view() {
-        // Review finding: compact -> expanded -> compact in the panel.
+        // Compact -> expanded -> compact in the panel.
         let rex = Fake::default();
         let mut a = app(&rex);
         let key = |c| TermEvent::Key(c);
@@ -1763,7 +1763,7 @@ mod tests {
 
     #[test]
     fn the_borderless_footer_uses_the_full_width() {
-        // Review finding: it was cut two columns short.
+        // The footer must not be cut two columns short.
         let rex = Fake::default();
         let mut a = app(&rex);
         a.focused = true;
@@ -1963,8 +1963,8 @@ mod tests {
 
     #[test]
     fn a_failed_save_survives_the_refresh_that_closing_the_panel_causes() {
-        // Review finding: the panel closes, the layer resizes, and the view
-        // event's refresh wiped the save error before it was drawn.
+        // The panel closes, the layer resizes, and the view event's refresh
+        // must not wipe the save error before it is drawn.
         let rex = Fake::default();
         let mut a = app(&rex);
         a.on_terminal_event(&TermEvent::Key(KeyCode::Char('o').into()), &[]);
@@ -1980,7 +1980,7 @@ mod tests {
 
     #[test]
     fn a_resize_after_the_retries_ran_out_gets_new_ones() {
-        // Review finding: no client for 5 s, then one attaches and its first
+        // No client for 5 s, then one attaches and its first
         // Resize lands before the pane reports a drawn size.
         let rex = Fake::default();
         sized(&rex, 1);

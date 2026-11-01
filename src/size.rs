@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn never_runs_past_the_bottom_of_the_window() {
-        // Review finding: a layer moved low, y = 0.97, wants to shrink.
+        // A layer moved low, y = 0.97, wants to shrink.
         let h = new_height(2, 10, PER, 0.97, 0.03);
         assert!(h.is_none_or(|h| 0.97 + h <= 1.0 + 1e-9), "{h:?}");
     }

@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn stays_open_for_a_spawned_worker_that_has_not_tagged_itself_yet() {
-        // Review finding: A is listed, B is spawned (open sees the roster and
+        // A is listed, B is spawned (open sees the roster and
         // returns null), A closes before B's meta lands.
         let mut m = Model::new(LEAD.into(), None, 0);
         m.apply(meta("block:a", LEAD, None), 0);
