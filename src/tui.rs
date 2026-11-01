@@ -355,10 +355,12 @@ impl App<'_> {
                     return true;
                 }
                 if let Some(panel) = &mut self.panel {
-                    if panel.key(k.code, &mut self.opts) == PanelAction::Close {
+                    let view = self.opts.view;
+                    let action = panel.key(k.code, &mut self.opts);
+                    self.apply_view_option(view);
+                    if action == PanelAction::Close {
                         self.close_panel();
                     }
-                    self.apply_view_option();
                     return false;
                 }
                 match k.code {
@@ -383,8 +385,9 @@ impl App<'_> {
                 let a = self.panel_area;
                 let inside = m.column >= a.x && m.column < a.right() && m.row >= a.y;
                 if inside && let Some(panel) = &mut self.panel {
+                    let view = self.opts.view;
                     panel.click(usize::from(m.row - a.y), &mut self.opts);
-                    self.apply_view_option();
+                    self.apply_view_option(view);
                 }
             }
             TermEvent::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
@@ -418,12 +421,11 @@ impl App<'_> {
         false
     }
 
-    /// The panel's view option is the starting view; changing it also
-    /// switches the current view, so the change shows when the panel closes.
-    fn apply_view_option(&mut self) {
-        if let Some(panel) = &self.panel
-            && self.opts.view != panel.start.view
-        {
+    /// The panel's view option is the starting view; changing it (from
+    /// `before`) also switches the current view, so the change shows when
+    /// the panel closes.
+    fn apply_view_option(&mut self, before: View) {
+        if self.opts.view != before {
             self.expanded = self.opts.view == View::Expanded;
         }
     }
@@ -537,7 +539,8 @@ impl App<'_> {
 
     fn draw(&mut self, f: &mut ratatui::Frame, rows: &[Row]) {
         let area = f.area();
-        let footer = self.footer_line(usize::from(area.width.saturating_sub(2)));
+        let chrome = 2 * u16::from(self.opts.border == Border::Rounded);
+        let footer = self.footer_line(usize::from(area.width.saturating_sub(chrome)));
         let inner = match self.opts.border {
             Border::None => area,
             Border::Rounded => {
@@ -1066,7 +1069,7 @@ mod tests {
         let screen = render_at(&mut a, &rows, 40, 2);
         assert_eq!(
             screen.lines().nth(1),
-            Some("⏎ show · v view · o options · l lead…   ")
+            Some("⏎ show · v view · o options · l lead ·… ")
         );
         a.on_terminal_event(&TermEvent::FocusLost, &rows);
         assert!(!render_at(&mut a, &rows, 40, 2).contains("l lead"));
@@ -1620,5 +1623,30 @@ mod tests {
         // With nowhere to save, closing reports it.
         a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
         assert!(a.error.as_deref().unwrap().contains("no config directory"));
+    }
+
+    #[test]
+    fn cycling_the_view_away_and_back_keeps_the_current_view() {
+        // Review finding: compact -> expanded -> compact in the panel.
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let key = |c| TermEvent::Key(c);
+        a.on_terminal_event(&key(KeyCode::Char('o').into()), &[]);
+        a.on_terminal_event(&key(KeyCode::Down.into()), &[]);
+        a.on_terminal_event(&key(KeyCode::Enter.into()), &[]);
+        assert!(a.expanded);
+        a.on_terminal_event(&key(KeyCode::Left.into()), &[]);
+        assert_eq!(a.opts.view, View::Compact);
+        assert!(!a.expanded);
+    }
+
+    #[test]
+    fn the_borderless_footer_uses_the_full_width() {
+        // Review finding: it was cut two columns short.
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.focused = true;
+        let screen = render_at(&mut a, &[], 45, 1);
+        assert_eq!(screen, FOOTER);
     }
 }
