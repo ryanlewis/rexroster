@@ -115,12 +115,26 @@ pub struct Row {
     pub age: Option<u64>,
     /// The root record's message, falling back to the task.
     pub msg: String,
+    /// The task from the meta record.
+    pub task: Option<String>,
 }
 
 /// What the model needs fetched after an event.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Needs {
+    /// Labels and placement, from `session.list_blocks`.
     pub blocks: bool,
+    /// The layout, from `session.view`, to find minimized workers.
+    pub view: bool,
+}
+
+impl Needs {
+    pub fn or(self, other: Needs) -> Needs {
+        Needs {
+            blocks: self.blocks || other.blocks,
+            view: self.view || other.view,
+        }
+    }
 }
 
 pub struct Model {
@@ -155,9 +169,19 @@ impl Model {
         let needs = match event {
             Event::BlockCreated(block) => {
                 self.blocks.entry(block).or_default().created = Some(now);
-                Needs { blocks: true }
+                Needs {
+                    blocks: true,
+                    ..Needs::default()
+                }
             }
-            Event::BlockChanged(_) | Event::ViewChanged => Needs { blocks: true },
+            Event::BlockChanged(_) => Needs {
+                blocks: true,
+                ..Needs::default()
+            },
+            Event::ViewChanged => Needs {
+                blocks: true,
+                view: true,
+            },
             Event::BlockClosed(block) => {
                 self.blocks.remove(&block);
                 Needs::default()
@@ -243,10 +267,22 @@ impl Model {
                     age: b.since.map(|s| now.saturating_sub(s)),
                     msg: root
                         .and_then(|r| r.msg.clone())
-                        .or(task)
+                        .or_else(|| task.clone())
                         .unwrap_or_default(),
+                    task,
                 }
             })
+            .collect()
+    }
+
+    /// Our workers that sit in a minimized floating layer of `view` (a
+    /// `session.view` snapshot). Minimizing a shown worker hides it, so these
+    /// get detached.
+    pub fn to_detach(&self, view: &Value) -> Vec<String> {
+        let mine: Vec<&String> = self.workers().map(|(id, _)| id).collect();
+        rex::minimized_blocks(view)
+            .into_iter()
+            .filter(|b| mine.contains(&b) && !self.ignored(b))
             .collect()
     }
 
@@ -450,9 +486,18 @@ mod tests {
         // Other blocks' structural events still ask for a refresh.
         assert_eq!(
             m.apply(Event::BlockCreated("block:w".into()), 0),
-            Needs { blocks: true }
+            Needs {
+                blocks: true,
+                view: false
+            }
         );
-        assert_eq!(m.apply(Event::ViewChanged, 0), Needs { blocks: true });
+        assert_eq!(
+            m.apply(Event::ViewChanged, 0),
+            Needs {
+                blocks: true,
+                view: true
+            }
+        );
     }
 
     #[test]
@@ -515,6 +560,7 @@ mod tests {
                 state: "working".into(),
                 age: Some(10),
                 msg: "Reading".into(),
+                task: Some("t".into()),
             }]
         );
         // The lead is never asked for its status.
@@ -607,5 +653,25 @@ mod tests {
         let row = &m.rows(600)[0];
         assert_eq!(row.state, "starting");
         assert_eq!(row.age, None);
+    }
+
+    #[test]
+    fn detaches_only_its_own_minimized_workers() {
+        let mut m = Model::new("block:lead".into(), Some("block:roster".into()), 0);
+        for b in ["block:mini", "block:shown"] {
+            m.apply(meta(b, "block:lead", None), 0);
+        }
+        m.apply(meta("block:theirs", "block:other-lead", None), 0);
+        let view: Value =
+            serde_json::from_str(include_str!("../testdata/view-minimized.json")).unwrap();
+        assert_eq!(m.to_detach(&view), ["block:mini"]);
+
+        // After the detach the block is in no layer, so the next pass finds nothing.
+        let after: Value = serde_json::from_str(
+            &include_str!("../testdata/view-minimized.json")
+                .replace("\"block:mini\"", "\"block:gone\""),
+        )
+        .unwrap();
+        assert!(m.to_detach(&after).is_empty());
     }
 }

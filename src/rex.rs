@@ -129,6 +129,22 @@ pub fn floating_layer_of(view: &Value, block: &str) -> Option<(String, [f64; 4])
     })
 }
 
+/// Every block in a minimized floating layer.
+pub fn minimized_blocks(view: &Value) -> Vec<String> {
+    let layers = view["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["layers"].as_array())
+        .flatten();
+    layers
+        .filter(|l| l["kind"].as_str() != Some("tiled") && l["state"].as_str() == Some("minimized"))
+        .filter_map(|l| l["blocks"].as_array())
+        .flatten()
+        .filter_map(|b| b["block_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
 fn layer_holds(layer: &Value, block: &str) -> bool {
     layer["blocks"]
         .as_array()

@@ -7,18 +7,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Row as TableRow, Table, TableState};
+use ratatui::widgets::Paragraph;
 use serde_json::json;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::events::{self, Event};
-use crate::model::{Model, Row, short_age};
+use crate::model::{Model, Needs, Row, short_age};
 use crate::rex::{self, Rex};
 use crate::size;
 
@@ -31,7 +32,15 @@ const MAX_FITS: u8 = 4;
 /// A terminal resize this long after our own counts as the user's, and gets fresh attempts.
 const OWN_RESIZE_WINDOW: Duration = Duration::from_secs(2);
 
-pub const FOOTER: &str = " ⏎ show/hide · l lead · q quit ";
+/// Key hints, shown on the last line while the roster has focus.
+pub const FOOTER: &str = "⏎ show/hide · v view · l lead · q quit";
+/// Expanded view: the most lines a message wraps to.
+pub const MSG_LINES: usize = 3;
+/// Expanded view: continuation lines start under the label.
+const INDENT: usize = 3;
+/// The label column's width follows the longest label, within these bounds.
+pub const LABEL_MIN: usize = 6;
+pub const LABEL_MAX: usize = 20;
 
 /// What wakes the loop: an event from Rex (`None` when the stream ends) or
 /// terminal input. Both arrive on one channel, so either wakes it at once.
@@ -68,8 +77,17 @@ struct App<'a> {
     session: String,
     model: Model,
     selected: Option<String>,
-    table: TableState,
-    table_area: Rect,
+    /// Where the rows were drawn, how many lines were scrolled off the top,
+    /// and which worker each drawn line belongs to.
+    list_area: Rect,
+    offset: usize,
+    line_owner: Vec<usize>,
+    /// The pane's width when last drawn; the expanded view wraps to it.
+    width: u16,
+    /// Several lines per worker instead of one.
+    expanded: bool,
+    /// Whether the pane has focus; the key hints show only then.
+    focused: bool,
     last_click: Option<(usize, Instant)>,
     error: Option<String>,
     fit: Fit,
@@ -97,8 +115,12 @@ pub fn run(lead: String, session: String) -> Result<()> {
         session,
         model: Model::new(lead, me, now()),
         selected: None,
-        table: TableState::default(),
-        table_area: Rect::default(),
+        list_area: Rect::default(),
+        offset: 0,
+        line_owner: Vec::new(),
+        width: 0,
+        expanded: false,
+        focused: false,
         last_click: None,
         error: None,
         fit: Fit::default(),
@@ -109,10 +131,10 @@ pub fn run(lead: String, session: String) -> Result<()> {
         .refresh(app.rex, &app.session, now())
         .and_then(|()| {
             let mut terminal = ratatui::init();
-            let _ = execute!(std::io::stdout(), EnableMouseCapture);
+            let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
             spawn_input(input_tx);
             let result = app.run(&mut terminal, &rx);
-            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            let _ = execute!(std::io::stdout(), DisableFocusChange, DisableMouseCapture);
             ratatui::restore();
             result
         });
@@ -129,7 +151,7 @@ impl App<'_> {
             if self.model.should_exit(now()) {
                 return Ok(());
             }
-            self.note_count(rows.len());
+            self.note_rows(total_lines(&rows, self.width, self.expanded));
             if self.fit.dirty {
                 self.fit_layer();
             }
@@ -142,10 +164,10 @@ impl App<'_> {
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => bail!("rex events stopped"),
             };
-            let mut needs_blocks = false;
+            let mut needs = Needs::default();
             for msg in first.into_iter().chain(rx.try_iter()) {
                 match msg {
-                    Msg::Rex(Some(event)) => needs_blocks |= self.model.apply(event, now()).blocks,
+                    Msg::Rex(Some(event)) => needs = needs.or(self.model.apply(event, now())),
                     Msg::Rex(None) => bail!("rex events stopped"),
                     Msg::Term(ev) => {
                         if self.on_terminal_event(&ev, &rows) {
@@ -154,14 +176,20 @@ impl App<'_> {
                     }
                 }
             }
-            if needs_blocks && let Err(err) = self.model.refresh(self.rex, &self.session, now()) {
+            if needs.view {
+                self.hide_minimized();
+            }
+            if needs.blocks
+                && let Err(err) = self.model.refresh(self.rex, &self.session, now())
+            {
                 self.error = Some(format!("{err:#}"));
             }
         }
     }
 
-    fn note_count(&mut self, count: usize) {
-        let want = size::wanted_rows(count);
+    /// Note the rows the pane needs: the workers' lines, plus the footer while focused.
+    fn note_rows(&mut self, lines: usize) {
+        let want = size::wanted_rows(lines, self.focused);
         if want != self.fit.want {
             self.fit = Fit {
                 dirty: true,
@@ -242,11 +270,12 @@ impl App<'_> {
                         }
                     }
                     KeyCode::Char('l') => self.focus_lead(),
+                    KeyCode::Char('v') => self.expanded = !self.expanded,
                     _ => {}
                 }
             }
             TermEvent::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(i) = self.row_at(m.column, m.row, rows.len()) {
+                if let Some(i) = self.row_at(m.column, m.row).filter(|&i| i < rows.len()) {
                     self.selected = Some(rows[i].block.clone());
                     let double = self
                         .last_click
@@ -259,6 +288,8 @@ impl App<'_> {
                     }
                 }
             }
+            TermEvent::FocusGained => self.focused = true,
+            TermEvent::FocusLost => self.focused = false,
             TermEvent::Resize(..) => {
                 self.fit.dirty = true;
                 let ours = self
@@ -283,13 +314,15 @@ impl App<'_> {
         self.selected = Some(rows[j].block.clone());
     }
 
-    fn row_at(&self, column: u16, row: u16, count: usize) -> Option<usize> {
-        let a = self.table_area;
+    /// The worker drawn at a screen position, on any of its lines.
+    fn row_at(&self, column: u16, row: u16) -> Option<usize> {
+        let a = self.list_area;
         if column < a.x || column >= a.right() || row < a.y || row >= a.bottom() {
             return None;
         }
-        let i = usize::from(row - a.y) + self.table.offset();
-        (i < count).then_some(i)
+        self.line_owner
+            .get(usize::from(row - a.y) + self.offset)
+            .copied()
     }
 
     /// Show a detached worker as a centred float beside the lead, or hide a shown one.
@@ -324,6 +357,31 @@ impl App<'_> {
         }
     }
 
+    /// Treat Rex's minimize as hide: detach any of our workers whose layer
+    /// was minimized. The detach changes the view again, and that pass finds
+    /// nothing left to do.
+    fn hide_minimized(&mut self) {
+        let view = match self
+            .rex
+            .call("session.view", json!({ "session_id": self.session }))
+        {
+            Ok(view) => view,
+            Err(err) => {
+                self.error = Some(format!("{err:#}"));
+                return;
+            }
+        };
+        for block in self.model.to_detach(&view) {
+            let res = self.rex.call(
+                "session.detach_block",
+                json!({ "session_id": self.session, "block_id": block }),
+            );
+            if let Err(err) = res {
+                self.error = Some(format!("{err:#}"));
+            }
+        }
+    }
+
     fn focus_lead(&mut self) {
         let res = self.rex.call(
             "session.focus_block",
@@ -335,34 +393,258 @@ impl App<'_> {
     }
 
     fn draw(&mut self, f: &mut ratatui::Frame, rows: &[Row]) {
-        let footer = match &self.error {
-            Some(err) => Line::styled(format!(" {err} "), Style::new().fg(Color::Red)),
-            None => Line::styled(FOOTER, Style::new().fg(Color::DarkGray)),
-        };
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::DarkGray))
-            .title(Line::styled(" workers ", Style::new().fg(Color::Gray)))
-            .title_bottom(footer);
         let area = f.area();
-        self.table_area = block.inner(area);
-        self.table.select(self.selected_index(rows));
-        let elapsed = self.spin_start.elapsed();
-        let table = Table::new(rows.iter().map(|r| table_row(r, elapsed)), WIDTHS)
-            .block(block)
-            .column_spacing(1)
-            .highlight_symbol("›")
-            .row_highlight_style(Style::new().add_modifier(Modifier::BOLD));
-        f.render_stateful_widget(table, area, &mut self.table);
+        let footer = u16::from(self.focused && area.height > 0);
+        let list = Rect {
+            height: area.height - footer,
+            ..area
+        };
+        self.list_area = list;
+        self.width = area.width;
+        let sel = self.selected_index(rows);
+        let laid = layout(
+            rows,
+            sel,
+            area.width,
+            self.spin_start.elapsed(),
+            self.expanded,
+        );
+        let visible = usize::from(list.height);
+        // Keep the whole selected worker on screen when the list is taller than the pane.
+        let end = sel.map_or(0, |i| {
+            laid.iter().rposition(|(o, _)| *o == i).map_or(0, |l| l + 1)
+        });
+        self.offset = end.saturating_sub(visible);
+        self.line_owner = laid.iter().map(|(o, _)| *o).collect();
+        let lines: Vec<Line> = laid
+            .into_iter()
+            .skip(self.offset)
+            .take(visible)
+            .map(|(_, l)| l)
+            .collect();
+        f.render_widget(Paragraph::new(lines), list);
+        if footer == 1 {
+            let width = usize::from(area.width);
+            let line = match &self.error {
+                Some(err) => Line::styled(cut(err, width), Style::new().fg(Color::Red)),
+                None => Line::styled(cut(FOOTER, width), Style::new().add_modifier(Modifier::DIM)),
+            };
+            let at = Rect {
+                y: area.bottom() - 1,
+                height: 1,
+                ..area
+            };
+            f.render_widget(Paragraph::new(line), at);
+        }
     }
 }
 
-const WIDTHS: [Constraint; 4] = [
-    Constraint::Length(2),
-    Constraint::Max(20),
-    Constraint::Length(3),
-    Constraint::Fill(1),
-];
+/// Column widths shared by every row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Columns {
+    pub label: usize,
+    pub age: usize,
+}
+
+impl Columns {
+    /// The label column fits the longest label, between `LABEL_MIN` and
+    /// `LABEL_MAX`; the age column fits the longest age.
+    pub fn for_rows(rows: &[Row]) -> Self {
+        let longest = rows.iter().map(|r| r.label.width()).max().unwrap_or(0);
+        let age = rows
+            .iter()
+            .filter_map(|r| r.age.map(|a| short_age(a).len()))
+            .max()
+            .unwrap_or(0);
+        Self {
+            label: longest.clamp(LABEL_MIN, LABEL_MAX),
+            age,
+        }
+    }
+}
+
+/// `s` cut to `width` display columns, ending in `…` when anything was cut.
+pub fn cut(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_owned();
+    }
+    let Some(room) = width.checked_sub(1) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > room {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    // Don't leave a space before the ellipsis.
+    let mut out = out.trim_end().to_owned();
+    out.push('…');
+    out
+}
+
+/// `s` cut to `width` and padded with spaces to exactly `width` columns.
+fn pad(s: &str, width: usize) -> String {
+    let s = cut(s, width);
+    let fill = width.saturating_sub(s.width());
+    format!("{s}{}", " ".repeat(fill))
+}
+
+/// One row: `›` when selected, the glyph, `▸` when shown, the label, the age
+/// right-aligned, then the message filling the rest of `width`.
+pub fn row_line(
+    r: &Row,
+    selected: bool,
+    cols: Columns,
+    width: u16,
+    elapsed: Duration,
+) -> Line<'static> {
+    let (g, style) = glyph(&r.state, elapsed);
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let strong = if selected {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
+    let mut spans = vec![
+        Span::styled(if selected { "›" } else { " " }, strong),
+        Span::styled(g, style),
+        Span::raw(if r.shown { "▸" } else { " " }),
+        Span::styled(pad(&r.label, cols.label), strong),
+    ];
+    let mut used = 3 + cols.label;
+    if cols.age > 0 {
+        let age = r.age.map(short_age).unwrap_or_default();
+        spans.push(Span::styled(format!(" {age:>w$}", w = cols.age), dim));
+        used += 1 + cols.age;
+    }
+    let room = usize::from(width).saturating_sub(used + 1);
+    if room > 0 && !r.msg.is_empty() {
+        spans.push(Span::raw(format!(" {}", cut(&r.msg, room))));
+    }
+    Line::from(spans)
+}
+
+/// Word-wrap `text` to `width` columns, in at most `max` lines. When it
+/// needs more, the last line ends in `…`.
+pub fn wrap(text: &str, width: usize, max: usize) -> Vec<String> {
+    if width == 0 || max == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word.to_owned();
+        loop {
+            let need = if line.is_empty() {
+                word.width()
+            } else {
+                line.width() + 1 + word.width()
+            };
+            if need <= width {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(&word);
+                break;
+            }
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            // A word longer than the line: break it.
+            let (head, tail) = split_at_width(&word, width);
+            lines.push(head);
+            word = tail;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > max {
+        // Greedy wrapping means the remaining lines can't share one line,
+        // so joining them always overflows and `cut` adds the ellipsis.
+        let rest = lines.split_off(max - 1).join(" ");
+        lines.push(cut(&rest, width));
+    }
+    lines
+}
+
+fn split_at_width(s: &str, width: usize) -> (String, String) {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width && i > 0 {
+            return (s[..i].to_owned(), s[i..].to_owned());
+        }
+        used += w;
+    }
+    (s.to_owned(), String::new())
+}
+
+/// The task line in the expanded view, when there is a task that isn't
+/// already the message.
+fn task_line(r: &Row) -> Option<&str> {
+    r.task.as_deref().filter(|t| *t != r.msg)
+}
+
+/// How many lines a worker takes at `width`.
+pub fn worker_height(r: &Row, width: u16, expanded: bool) -> usize {
+    if !expanded {
+        return 1;
+    }
+    let room = usize::from(width).saturating_sub(INDENT);
+    1 + wrap(&r.msg, room, MSG_LINES).len() + usize::from(task_line(r).is_some())
+}
+
+/// The lines all workers take at `width`.
+pub fn total_lines(rows: &[Row], width: u16, expanded: bool) -> usize {
+    rows.iter().map(|r| worker_height(r, width, expanded)).sum()
+}
+
+/// Every drawn line, with the index of the worker it belongs to.
+pub fn layout(
+    rows: &[Row],
+    sel: Option<usize>,
+    width: u16,
+    elapsed: Duration,
+    expanded: bool,
+) -> Vec<(usize, Line<'static>)> {
+    let cols = Columns::for_rows(rows);
+    let mut out = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let selected = sel == Some(i);
+        if !expanded {
+            out.push((i, row_line(r, selected, cols, width, elapsed)));
+            continue;
+        }
+        let bold = if selected {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        // Line 1: markers, label and age, with no message.
+        let header = Row {
+            msg: String::new(),
+            ..r.clone()
+        };
+        out.push((i, row_line(&header, selected, cols, width, elapsed)));
+        let indent = " ".repeat(INDENT);
+        let room = usize::from(width).saturating_sub(INDENT);
+        for text in wrap(&r.msg, room, MSG_LINES) {
+            out.push((i, Line::styled(format!("{indent}{text}"), bold)));
+        }
+        if let Some(task) = task_line(r) {
+            let dim = bold.add_modifier(Modifier::DIM);
+            out.push((i, Line::styled(format!("{indent}{}", cut(task, room)), dim)));
+        }
+    }
+    out
+}
 
 /// The `working` glyph: braille dots turning clockwise, one frame per `SPIN_TICK`.
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -400,20 +682,6 @@ pub fn glyph(state: &str, elapsed: Duration) -> (&'static str, Style) {
     }
 }
 
-fn table_row(r: &Row, elapsed: Duration) -> TableRow<'_> {
-    let (g, style) = glyph(&r.state, elapsed);
-    let dim = Style::new().add_modifier(Modifier::DIM);
-    TableRow::new([
-        Cell::from(Line::from(vec![
-            Span::styled(g, style),
-            Span::raw(if r.shown { "▸" } else { " " }),
-        ])),
-        Cell::from(r.label.as_str()),
-        Cell::from(Span::styled(r.age.map(short_age).unwrap_or_default(), dim)),
-        Cell::from(r.msg.as_str()),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +698,7 @@ mod tests {
             state: state.into(),
             age: Some(75),
             msg: "Running tests".into(),
+            task: None,
         }
     }
 
@@ -439,8 +708,12 @@ mod tests {
             session: "s".into(),
             model: Model::new("block:lead".into(), Some("block:me".into()), 0),
             selected: None,
-            table: TableState::default(),
-            table_area: Rect::default(),
+            list_area: Rect::default(),
+            offset: 0,
+            line_owner: Vec::new(),
+            width: 0,
+            expanded: false,
+            focused: false,
             last_click: None,
             error: None,
             fit: Fit::default(),
@@ -449,7 +722,11 @@ mod tests {
     }
 
     fn render(app: &mut App, rows: &[Row]) -> String {
-        let mut t = Terminal::new(TestBackend::new(52, 5)).unwrap();
+        render_at(app, rows, 52, 5)
+    }
+
+    fn render_at(app: &mut App, rows: &[Row], width: u16, height: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
         t.draw(|f| app.draw(f, rows)).unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.height)
@@ -462,25 +739,149 @@ mod tests {
             .join("\n")
     }
 
+    fn worker(label: &str, state: &str, shown: bool, age: Option<u64>, msg: &str) -> Row {
+        Row {
+            block: format!("block:{label}"),
+            label: label.into(),
+            shown,
+            state: state.into(),
+            age,
+            msg: msg.into(),
+            task: None,
+        }
+    }
+
     #[test]
-    fn draws_rows_with_glyph_marker_age_and_msg() {
+    fn draws_compact_rows_with_no_frame() {
         let rex = Fake::default();
         let mut a = app(&rex);
         let rows = [
-            row("block:1", "alpha", "working", true),
-            row("block:2", "beta", "done", false),
-            row("block:3", "gamma", "blocked", false),
+            worker("alpha", "working", true, Some(75), "Running tests"),
+            worker("beta", "done", false, Some(5), "PR raised"),
+            worker(
+                "gamma-long",
+                "blocked",
+                false,
+                Some(4000),
+                "Allow git push to the remote?",
+            ),
         ];
-        let screen = render(&mut a, &rows);
-        let lines: Vec<&str> = screen.lines().collect();
-        assert!(lines[0].contains("workers"));
-        // Rendered within the first spinner tick, so frame 0.
-        assert!(lines[1].contains("›⠋▸ alpha"), "{}", lines[1]);
-        assert!(lines[1].contains(" 1m  Running tests"), "{}", lines[1]);
-        assert!(!lines[1].contains("working"), "{}", lines[1]);
-        assert!(lines[2].contains(" ✓  beta"), "{}", lines[2]);
-        assert!(lines[3].contains(" ◐  gamma"), "{}", lines[3]);
-        assert!(lines[4].contains("l lead"), "{}", lines[4]);
+        // Rendered within the first spinner tick, so frame 0. Unfocused: no footer.
+        assert_eq!(
+            render_at(&mut a, &rows, 40, 4),
+            [
+                "›⠋▸alpha      1m Running tests          ",
+                " ✓ beta       5s PR raised              ",
+                " ◐ gamma-long 1h Allow git push to the… ",
+                "                                        ",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn label_width_follows_the_longest_label_within_bounds() {
+        let r = |l: &str| worker(l, "idle", false, None, "");
+        assert_eq!(
+            Columns::for_rows(&[r("ab")]),
+            Columns {
+                label: LABEL_MIN,
+                age: 0
+            }
+        );
+        assert_eq!(Columns::for_rows(&[r("ab"), r("a-twelve-chr")]).label, 12);
+        assert_eq!(Columns::for_rows(&[r(&"x".repeat(40))]).label, LABEL_MAX);
+        let aged = [
+            worker("a", "idle", false, Some(5), ""),
+            worker("b", "idle", false, Some(700), ""),
+        ];
+        assert_eq!(Columns::for_rows(&aged).age, 3);
+    }
+
+    #[test]
+    fn cuts_with_an_ellipsis() {
+        assert_eq!(cut("hello", 5), "hello");
+        assert_eq!(cut("hello", 4), "hel…");
+        assert_eq!(cut("hello", 1), "…");
+        assert_eq!(cut("hello", 0), "");
+        // Wide characters count as two columns.
+        assert_eq!(cut("日本語", 4), "日…");
+        assert_eq!(cut("to the remote", 8), "to the…");
+    }
+
+    #[test]
+    fn long_labels_are_cut_at_the_cap() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let rows = [worker(
+            "a-very-long-worker-label-indeed",
+            "idle",
+            false,
+            None,
+            "hi",
+        )];
+        let line = render_at(&mut a, &rows, 30, 1);
+        assert_eq!(line, "›○ a-very-long-worker-… hi    ");
+    }
+
+    #[test]
+    fn footer_shows_only_while_focused() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let rows = [worker("alpha", "idle", false, Some(5), "hi")];
+        assert!(!render_at(&mut a, &rows, 40, 2).contains("l lead"));
+        a.on_terminal_event(&TermEvent::FocusGained, &rows);
+        let screen = render_at(&mut a, &rows, 40, 2);
+        assert_eq!(
+            screen.lines().nth(1),
+            Some("⏎ show/hide · v view · l lead · q quit  ")
+        );
+        a.on_terminal_event(&TermEvent::FocusLost, &rows);
+        assert!(!render_at(&mut a, &rows, 40, 2).contains("l lead"));
+    }
+
+    #[test]
+    fn scrolls_to_keep_the_selection_visible() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let rows: Vec<Row> = ["a1", "a2", "a3"]
+            .iter()
+            .map(|l| worker(l, "idle", false, None, ""))
+            .collect();
+        a.selected = Some("block:a3".into());
+        let screen = render_at(&mut a, &rows, 12, 2);
+        assert!(
+            screen.lines().nth(1).unwrap().starts_with("›○ a3"),
+            "{screen}"
+        );
+        assert_eq!(a.offset, 1);
+    }
+
+    #[test]
+    fn a_focus_change_resizes_once_for_the_footer() {
+        let rex = Fake::default();
+        // The pane has 3 rows, for 3 workers: it fits until the footer shows.
+        sized(&rex, 3);
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        a.fit_layer();
+        assert!(rex.params("session.resize_layer").is_empty());
+
+        a.on_terminal_event(&TermEvent::FocusGained, &[]);
+        a.note_rows(3);
+        assert!(a.fit.dirty);
+        a.fit_layer();
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        // The pane now has the 4 rows it wants: no further resize.
+        sized(&rex, 4);
+        a.on_terminal_event(&TermEvent::Resize(40, 4), &[]);
+        a.note_rows(3);
+        a.fit_layer();
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        // Another loop pass with nothing new does nothing.
+        a.note_rows(3);
+        assert!(!a.fit.dirty);
     }
 
     #[test]
@@ -547,7 +948,7 @@ mod tests {
         let click = TermEvent::Mouse(ratatui::crossterm::event::MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
-            row: 2,
+            row: 1,
             modifiers: KeyModifiers::NONE,
         });
         a.on_terminal_event(&click, &rows);
@@ -575,10 +976,10 @@ mod tests {
     #[test]
     fn fits_the_layer_to_the_rows() {
         let rex = Fake::default();
-        sized(&rex, 3);
+        sized(&rex, 1);
         let mut a = app(&rex);
         a.model.me = Some("block:roster".into());
-        a.note_count(3);
+        a.note_rows(3);
         a.fit_layer();
         let p = &rex.params("session.resize_layer")[0];
         assert_eq!(p["layer_id"], "layer:float");
@@ -590,10 +991,10 @@ mod tests {
     #[test]
     fn does_not_resize_when_it_fits_or_before_the_pane_is_drawn() {
         let rex = Fake::default();
-        sized(&rex, 5);
+        sized(&rex, 3);
         let mut a = app(&rex);
         a.model.me = Some("block:roster".into());
-        a.note_count(3);
+        a.note_rows(3);
         a.fit_layer();
         assert!(rex.params("session.resize_layer").is_empty());
 
@@ -610,10 +1011,10 @@ mod tests {
     fn stops_resizing_after_max_fits() {
         let rex = Fake::default();
         // The rows never change, as if every resize lands on the same height.
-        sized(&rex, 3);
+        sized(&rex, 1);
         let mut a = app(&rex);
         a.model.me = Some("block:roster".into());
-        a.note_count(3);
+        a.note_rows(3);
         for _ in 0..10 {
             a.fit.dirty = true;
             a.fit_layer();
@@ -682,6 +1083,129 @@ mod tests {
             .map(|(x, y, _)| (x, y))
             .collect();
         // ratatui writes only the diff, so the frame is one cell: no flicker.
-        assert_eq!(changed, [(2, 1)]);
+        assert_eq!(changed, [(1, 0)]);
+    }
+
+    #[test]
+    fn wraps_words_and_caps_with_an_ellipsis() {
+        assert_eq!(wrap("one two three", 7, 3), ["one two", "three"]);
+        assert_eq!(wrap("", 10, 3), Vec::<String>::new());
+        // A word longer than the line is broken.
+        assert_eq!(wrap("abcdefghij", 4, 3), ["abcd", "efgh", "ij"]);
+        // Too long for three lines: the third ends in an ellipsis.
+        assert_eq!(
+            wrap("aa bb cc dd ee ff gg", 5, 3),
+            ["aa bb", "cc dd", "ee f…"]
+        );
+        assert_eq!(wrap("text", 0, 3), Vec::<String>::new());
+    }
+
+    fn tasked(label: &str, msg: &str, task: Option<&str>) -> Row {
+        Row {
+            task: task.map(Into::into),
+            ..worker(label, "blocked", false, Some(5), msg)
+        }
+    }
+
+    #[test]
+    fn worker_height_in_each_view() {
+        let short = tasked("a", "Allow push?", Some("fix login"));
+        let long = tasked("b", &"word ".repeat(40), Some("bump deps"));
+        let same = tasked("c", "fix login", Some("fix login"));
+        let none = tasked("d", "", None);
+        for r in [&short, &long, &same, &none] {
+            assert_eq!(worker_height(r, 30, false), 1);
+        }
+        // Header, one msg line, the task.
+        assert_eq!(worker_height(&short, 30, true), 3);
+        // Header, msg capped at three lines, the task.
+        assert_eq!(worker_height(&long, 30, true), 1 + MSG_LINES + 1);
+        // The task is left out when it is the message.
+        assert_eq!(worker_height(&same, 30, true), 2);
+        assert_eq!(worker_height(&none, 30, true), 1);
+
+        let rows = [short, long, same, none];
+        assert_eq!(total_lines(&rows, 30, false), 4);
+        assert_eq!(total_lines(&rows, 30, true), 3 + 5 + 2 + 1);
+        assert_eq!(size::wanted_rows(total_lines(&rows, 30, true), true), 12);
+    }
+
+    #[test]
+    fn draws_the_expanded_view() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('v').into()), &[]);
+        assert!(a.expanded);
+        let rows = [
+            tasked(
+                "alpha",
+                "Allow git push to the remote branch now?",
+                Some("fix login"),
+            ),
+            tasked("beta", "PR raised", None),
+        ];
+        assert_eq!(
+            render_at(&mut a, &rows, 24, 6),
+            [
+                "›◐ alpha  5s            ",
+                "   Allow git push to the",
+                "   remote branch now?   ",
+                "   fix login            ",
+                " ◐ beta   5s            ",
+                "   PR raised            ",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn clicks_on_any_line_pick_the_worker() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.expanded = true;
+        let rows = [
+            tasked("alpha", "one", Some("task a")),
+            tasked("beta", "two", None),
+        ];
+        render_at(&mut a, &rows, 24, 6);
+        assert_eq!(a.line_owner, [0, 0, 0, 1, 1]);
+        assert_eq!(a.row_at(3, 2), Some(0));
+        assert_eq!(a.row_at(3, 3), Some(1));
+        assert_eq!(a.row_at(3, 4), Some(1));
+        assert_eq!(a.row_at(3, 5), None);
+        // j moves by worker, not by line.
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('j').into()), &rows);
+        assert_eq!(a.selected.as_deref(), Some("block:beta"));
+    }
+
+    #[test]
+    fn toggling_the_view_or_a_rewrap_resizes_once() {
+        let rex = Fake::default();
+        sized(&rex, 2);
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.width = 24;
+        let mut rows = vec![
+            tasked("alpha", "short", None),
+            tasked("beta", "short", None),
+        ];
+        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        a.fit_layer();
+        assert!(rex.params("session.resize_layer").is_empty());
+
+        a.expanded = true;
+        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        a.fit_layer();
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        sized(&rex, 4);
+        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        assert!(!a.fit.dirty);
+
+        // A longer message wraps to two lines: one more resize.
+        rows[0].msg = "a message that needs two lines".into();
+        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        assert!(a.fit.dirty);
+        a.fit_layer();
+        assert_eq!(rex.params("session.resize_layer").len(), 2);
     }
 }

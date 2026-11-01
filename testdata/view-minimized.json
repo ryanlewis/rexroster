@@ -1,0 +1,51 @@
+{
+  "session_id": "session:test",
+  "windows": [
+    {
+      "window_id": "window:1",
+      "layers": [
+        {
+          "layer_id": "layer:tiled",
+          "kind": "tiled",
+          "bounds": [0, 0, 1, 1],
+          "layout": { "rect": [0, 0, 1, 1], "block_id": "block:lead" },
+          "blocks": [{ "block_id": "block:lead" }]
+        },
+        {
+          "layer_id": "layer:roster",
+          "kind": "floating",
+          "state": "minimized",
+          "bounds": [0.72, 0.02, 0.27, 0.12],
+          "blocks": [{ "block_id": "block:roster" }]
+        },
+        {
+          "layer_id": "layer:mini",
+          "kind": "floating",
+          "state": "minimized",
+          "bounds": [0.1, 0.08, 0.8, 0.84],
+          "blocks": [{ "block_id": "block:mini" }]
+        },
+        {
+          "layer_id": "layer:shown",
+          "kind": "floating",
+          "bounds": [0.1, 0.08, 0.8, 0.84],
+          "blocks": [{ "block_id": "block:shown" }]
+        },
+        {
+          "layer_id": "layer:plain",
+          "kind": "floating",
+          "state": "minimized",
+          "bounds": [0.1, 0.08, 0.8, 0.8],
+          "blocks": [{ "block_id": "block:plain-shell" }]
+        },
+        {
+          "layer_id": "layer:theirs",
+          "kind": "floating",
+          "state": "minimized",
+          "bounds": [0.1, 0.08, 0.8, 0.84],
+          "blocks": [{ "block_id": "block:theirs" }]
+        }
+      ]
+    }
+  ]
+}
