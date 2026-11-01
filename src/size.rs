@@ -30,10 +30,11 @@ pub fn new_height(want: u16, rows: u16, per_row: f64, y: f64, h: f64) -> Option<
     if missing == 0.0 || per_row <= 0.0 || !per_row.is_finite() {
         return None;
     }
+    // The window's bottom edge wins over the minimum height.
     let target = (h + missing * per_row)
         .min(MAX_HEIGHT)
-        .min(1.0 - y)
-        .max(per_row * MIN_ROWS);
+        .max(per_row * MIN_ROWS)
+        .min(1.0 - y);
     ((target - h).abs() > 1e-6).then_some(target)
 }
 
@@ -102,5 +103,12 @@ mod tests {
             assert!(resizes < 3, "bouncing");
         }
         assert_eq!(rows_of(h), want);
+    }
+
+    #[test]
+    fn never_runs_past_the_bottom_of_the_window() {
+        // Review finding: a layer moved low, y = 0.97, wants to shrink.
+        let h = new_height(2, 10, PER, 0.97, 0.03);
+        assert!(h.is_none_or(|h| 0.97 + h <= 1.0 + 1e-9), "{h:?}");
     }
 }

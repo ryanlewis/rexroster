@@ -1,7 +1,7 @@
 //! The roster TUI: one `rex events` stream feeds the model; rows are redrawn
 //! in place (ratatui only writes the cells that changed).
 
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -32,6 +32,30 @@ const MAX_FITS: u8 = 4;
 const OWN_RESIZE_WINDOW: Duration = Duration::from_secs(2);
 
 pub const FOOTER: &str = " ⏎ show/hide · l lead · q quit ";
+
+/// What wakes the loop: an event from Rex (`None` when the stream ends) or
+/// terminal input. Both arrive on one channel, so either wakes it at once.
+enum Msg {
+    Rex(Option<Event>),
+    Term(TermEvent),
+}
+
+impl From<Option<Event>> for Msg {
+    fn from(e: Option<Event>) -> Self {
+        Msg::Rex(e)
+    }
+}
+
+/// Forward terminal input to the loop's channel.
+fn spawn_input(tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if tx.send(Msg::Term(ev)).is_err() {
+                return;
+            }
+        }
+    });
+}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -65,6 +89,7 @@ pub fn run(lead: String, session: String) -> Result<()> {
     let cli = rex::Cli::new();
     let me = std::env::var("REX_BLOCK").ok().filter(|s| !s.is_empty());
     let (tx, rx) = mpsc::channel();
+    let input_tx = tx.clone();
     // Subscribe before the first refresh so nothing falls between them.
     let mut child = events::spawn(&cli, &session, tx)?;
     let mut app = App {
@@ -85,6 +110,7 @@ pub fn run(lead: String, session: String) -> Result<()> {
         .and_then(|()| {
             let mut terminal = ratatui::init();
             let _ = execute!(std::io::stdout(), EnableMouseCapture);
+            spawn_input(input_tx);
             let result = app.run(&mut terminal, &rx);
             let _ = execute!(std::io::stdout(), DisableMouseCapture);
             ratatui::restore();
@@ -97,20 +123,8 @@ pub fn run(lead: String, session: String) -> Result<()> {
 }
 
 impl App<'_> {
-    fn run(&mut self, terminal: &mut DefaultTerminal, rx: &Receiver<Option<Event>>) -> Result<()> {
+    fn run(&mut self, terminal: &mut DefaultTerminal, rx: &Receiver<Msg>) -> Result<()> {
         loop {
-            let mut needs_blocks = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(Some(event)) => needs_blocks |= self.model.apply(event, now()).blocks,
-                    Ok(None) | Err(TryRecvError::Disconnected) => bail!("rex events stopped"),
-                    Err(TryRecvError::Empty) => break,
-                }
-            }
-            if needs_blocks && let Err(err) = self.model.refresh(self.rex, &self.session, now()) {
-                self.error = Some(format!("{err:#}"));
-            }
-
             let rows = self.model.rows(now());
             if self.model.should_exit(now()) {
                 return Ok(());
@@ -121,11 +135,27 @@ impl App<'_> {
             }
             terminal.draw(|f| self.draw(f, &rows))?;
 
-            if event::poll(tick(&rows))? {
-                let quit = self.on_terminal_event(&event::read()?, &rows);
-                if quit {
-                    return Ok(());
+            // Sleep until a message arrives or the tick is due, then take
+            // everything that is waiting.
+            let first = match rx.recv_timeout(tick(&rows)) {
+                Ok(msg) => Some(msg),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => bail!("rex events stopped"),
+            };
+            let mut needs_blocks = false;
+            for msg in first.into_iter().chain(rx.try_iter()) {
+                match msg {
+                    Msg::Rex(Some(event)) => needs_blocks |= self.model.apply(event, now()).blocks,
+                    Msg::Rex(None) => bail!("rex events stopped"),
+                    Msg::Term(ev) => {
+                        if self.on_terminal_event(&ev, &rows) {
+                            return Ok(());
+                        }
+                    }
                 }
+            }
+            if needs_blocks && let Err(err) = self.model.refresh(self.rex, &self.session, now()) {
+                self.error = Some(format!("{err:#}"));
             }
         }
     }
