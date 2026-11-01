@@ -35,6 +35,10 @@ const MAX_FITS: u8 = 4;
 /// A terminal resize this long after our own counts as the user's, and gets fresh attempts.
 const OWN_RESIZE_WINDOW: Duration = Duration::from_secs(2);
 
+/// What [`App::measure`] finds: the layer id, its bounds, and the new height
+/// and new `(x, width)` when they need to change.
+type Measured = (String, [f64; 4], Option<f64>, Option<(f64, f64)>);
+
 /// Key hints, shown on the last line while the roster has focus.
 pub const FOOTER: &str = "⏎ show · v view · o options · l lead · q quit";
 /// Hints on the options panel's last line.
@@ -388,7 +392,7 @@ impl App<'_> {
                 .call("session.view", json!({ "session_id": self.session }))
                 .ok(),
         };
-        let Some((layer, bounds, height)) = view.and_then(|v| self.measure(&me, &v)) else {
+        let Some((layer, bounds, height, width)) = view.and_then(|v| self.measure(&me, &v)) else {
             if let Some(delay) = size::retry_delay(self.fit.retries) {
                 self.fit.retries += 1;
                 self.fit.retry_at = Some(Instant::now() + delay);
@@ -397,8 +401,12 @@ impl App<'_> {
         };
         self.fit.retries = 0;
         self.fit.retry_at = None;
-        let [x, y, w, _] = bounds;
-        let Some(new_h) = height else { return };
+        if height.is_none() && width.is_none() {
+            return;
+        }
+        let [x, y, w, h] = bounds;
+        let (x, w) = width.unwrap_or((x, w));
+        let new_h = height.unwrap_or(h);
         self.fit.attempts += 1;
         self.fit.last_resize = Some(Instant::now());
         let res = self.rex.call(
@@ -415,16 +423,24 @@ impl App<'_> {
     }
 
     /// The roster's layer in `view`, its bounds and, if it doesn't fit, the
-    /// height it should have.
-    fn measure(&self, me: &str, view: &Value) -> Option<(String, [f64; 4], Option<f64>)> {
+    /// height and the left edge and width it should have.
+    fn measure(&mut self, me: &str, view: &Value) -> Option<Measured> {
         let (layer, bounds) = rex::floating_layer_of(view, me)?;
         let lead = &self.model.lead;
         let lead_h = rex::rect_height_of(view, lead)?;
-        let lead_rows = rex::drawn_rows(&self.rex.block_call(&self.session, lead, "size").ok()?)?;
-        let rows = rex::drawn_rows(&self.rex.block_call(&self.session, me, "size").ok()?)?;
+        let lead_size = self.rex.block_call(&self.session, lead, "size").ok()?;
+        let my_size = self.rex.block_call(&self.session, me, "size").ok()?;
+        let lead_rows = rex::drawn_rows(&lead_size)?;
+        let rows = rex::drawn_rows(&my_size)?;
         let per_row = lead_h / f64::from(lead_rows);
         let new_h = size::new_height(self.fit.want, rows, per_row, bounds[1], bounds[3]);
-        Some((layer, bounds, new_h))
+        // Older Rex servers may not report columns; then only the height fits.
+        let new_w = (|| {
+            let per_col =
+                rex::rect_width_of(view, lead)? / f64::from(rex::drawn_columns(&lead_size)?);
+            size::new_width(rex::drawn_columns(&my_size)?, per_col, bounds[0], bounds[2])
+        })();
+        Some((layer, bounds, new_h, new_w))
     }
 
     fn selected_index(&self, rows: &[Row]) -> Option<usize> {
@@ -1321,6 +1337,37 @@ mod tests {
         // Lead: 0.5 of the window over 25 rows, so 0.02 a row; 2 rows missing.
         let h = p["bounds"][3].as_f64().unwrap();
         assert!((h - 0.16).abs() < 1e-9, "{h}");
+    }
+
+    #[test]
+    fn widens_a_narrow_layer_and_keeps_its_height() {
+        let rex = Fake::default();
+        sized(&rex, 3);
+        // Lead: the full window width over 100 columns, so 0.01 a column.
+        rex.on(
+            "block:lead size",
+            json!({"rows": 25, "columns": 100, "desired": [{"rows": 25}]}),
+        );
+        rex.on(
+            "block:roster size",
+            json!({"rows": 3, "columns": 20, "desired": [{"rows": 3}]}),
+        );
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        a.fit_layer();
+        let p = &rex.params("session.resize_layer")[0];
+        let b: Vec<f64> = p["bounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        // 30 columns missing: 0.27 + 0.30 wide, right edge still at 0.99.
+        assert!((b[2] - 0.57).abs() < 1e-9, "{b:?}");
+        assert!((b[0] + b[2] - 0.99).abs() < 1e-9, "{b:?}");
+        assert_eq!(b[1], 0.02);
+        assert!((b[3] - 0.12).abs() < 1e-9, "{b:?}");
     }
 
     #[test]

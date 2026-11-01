@@ -153,19 +153,28 @@ fn layer_holds(layer: &Value, block: &str) -> bool {
 
 /// The height, as a fraction of the window, of the layout cell showing `block`.
 pub fn rect_height_of(view: &Value, block: &str) -> Option<f64> {
+    rect_field(view, block, 3)
+}
+
+/// The width, as a fraction of the window, of the layout cell showing `block`.
+pub fn rect_width_of(view: &Value, block: &str) -> Option<f64> {
+    rect_field(view, block, 2)
+}
+
+fn rect_field(view: &Value, block: &str, i: usize) -> Option<f64> {
     match view {
         Value::Object(map) => {
             if map.get("block_id").and_then(Value::as_str) == Some(block)
-                && let Some(h) = map
+                && let Some(v) = map
                     .get("rect")
-                    .and_then(|r| r.get(3))
+                    .and_then(|r| r.get(i))
                     .and_then(Value::as_f64)
             {
-                return Some(h);
+                return Some(v);
             }
-            map.values().find_map(|v| rect_height_of(v, block))
+            map.values().find_map(|v| rect_field(v, block, i))
         }
-        Value::Array(items) => items.iter().find_map(|v| rect_height_of(v, block)),
+        Value::Array(items) => items.iter().find_map(|v| rect_field(v, block, i)),
         _ => None,
     }
 }
@@ -180,6 +189,13 @@ pub fn drawn_rows(size: &Value) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// A terminal's columns from its `size` method, on the same terms as
+/// [`drawn_rows`].
+pub fn drawn_columns(size: &Value) -> Option<u16> {
+    drawn_rows(size)?;
+    u16::try_from(size["columns"].as_u64()?).ok()
 }
 
 #[cfg(test)]
