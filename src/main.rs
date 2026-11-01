@@ -31,11 +31,11 @@ fn main() -> ExitCode {
 const AGENT_GUIDE: &str = include_str!("../docs/agent.md");
 
 fn run(cli: Cli) -> Result<()> {
-    let display = cli.subcommand_display()?;
     if let Some(Command::Skill) = cli.command {
         print!("{AGENT_GUIDE}");
         return Ok(());
     }
+    let display = cli.subcommand_display()?;
     if let Some(Command::Watch) = cli.command {
         // The watcher hears every session, so it needs no REX_SESSION.
         let opts = config::load_strict(config::path().as_deref())?;

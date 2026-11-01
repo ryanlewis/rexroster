@@ -42,7 +42,8 @@ It prints one line of JSON:
 Record `block_id`: every later call about this worker needs it. The worker has
 no layer. `roster_layer_id` is `null` when the roster was already open. If the
 roster could not open, a warning goes to stderr and the worker runs anyway.
-`spawn` also starts the watcher (below) if none is running.
+`spawn` also starts the watcher (below) if none is running and the config
+allows it.
 
 ## Read a worker's state
 
@@ -50,10 +51,12 @@ Claude Code reports its state to Rex. Read that instead of the screen:
 
 ```sh
 rex block call -s "$REX_SESSION" -b <block_id> program_status '{}' \
-  | jq -r '.records[] | select(.app == "claude-code") | "\(.state) \(.kind // "") \(.msg // "")"'
+  | jq -r '.records[] | select(.app == "claude-code" and (.id // "") == "")
+           | "\(.state) \(.kind // "") \(.msg // "")"'
 ```
 
-The state is one of:
+Use only the record with no `id`: records with an `id` are the worker's
+subagents, and their state is not the worker's. The state is one of:
 
 - `idle`: waiting for input. A new worker is ready for its first message.
 - `working`: busy. `msg` is the current step.
@@ -113,7 +116,7 @@ It prints the new layer id, or nothing if one is already open.
 ## The watcher
 
 `rexroster watch` runs in the background, one per user per Rex server; `spawn`
-and `open` start it. When a detached worker turns `blocked`, it floats the
+and `open` start it unless the config sets `watch = false`. When a detached worker turns `blocked`, it floats the
 worker into the session's active tab so the user sees the prompt. When the
 worker moves to any other state, it detaches it again. If you answer a prompt
 yourself, the watcher hides the worker; don't detach it yourself. Workers that
