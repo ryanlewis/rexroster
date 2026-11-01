@@ -69,7 +69,7 @@ The roster lists a block only when this record names its own lead.
 
 By default the roster has no frame or title, because Rex's pane title already names it. In the compact view (the default) each worker takes one line:
 
-- `›` on the selected worker
+- `›` on the selected worker, while the roster has focus
 - a glyph for the state of the worker's root status record (the one Claude Code reports): a turning braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) while working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
 - `▸` if the worker is shown
 - the label, in a column as wide as the longest label (6 to 20 characters)
