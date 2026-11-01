@@ -4,7 +4,7 @@ rexroster is a small terminal UI and command-line tool for [Rex](https://www.sup
 
 Claude Code tells Rex what it is doing (working, waiting on a prompt, done) through Rex's [program status protocol](https://www.superlogical.com/rex/docs/build/program-status), and the roster shows that state for each worker. Any other program that sends those records works the same way.
 
-rexroster is intended to be used mainly by your lead agents, not directly by you. Point a lead at `rexroster skill`, which prints a guide to starting and managing workers, and it runs the commands below itself. What you work with is the roster pane.
+rexroster is intended to be used mainly by your lead agents, not directly by you. The lead runs the commands; you watch and use the roster pane.
 
 ![The roster in its floating pane as a lead starts four workers. Each shows a spinner and its current step, then a tick when it finishes. With focus, the roster switches to the expanded view and back, and turns on a border from its options panel.](docs/demo/demo.gif)
 
@@ -24,9 +24,11 @@ cargo install --locked --git https://github.com/ryanlewis/rexroster
 
 or, from a clone, `cargo install --locked --path .`.
 
-## Typical use
+## Setting up a lead
 
-The lead agent runs this from its own pane:
+Tell the lead agent to run `rexroster skill` and follow it. The command prints a guide for an agent acting as the lead: how to start workers, read their state, show, hide and close them, and the traps to avoid. The guide is built into the binary, so it always matches the installed version. Point the agent at the command; don't copy the guide into its instructions.
+
+To start a worker, the lead runs this from its own pane:
 
 ```sh
 rexroster spawn "$REX_BLOCK" fix-login --task "fix the login redirect" --cwd ~/dev/app -- "$(command -v claude)" "…"
@@ -67,10 +69,6 @@ ESC ] 7501 ; state=idle:id=meta:app=rexlead:msg=<base64 of {"lead":…,"task":�
 
 The roster lists a block only when this record names its own lead.
 
-### Using it from an agent
-
-`rexroster skill` prints a guide for an AI agent acting as the lead: how to start workers, read their state, show, hide and close them, and the traps to avoid. The guide is built into the binary, so it always matches the installed version. Point the agent at `rexroster skill` rather than copying the guide into its instructions.
-
 ## The roster
 
 By default the roster has no frame or title, because Rex's pane title already names it. In the compact view (the default) each worker takes one line:
@@ -97,7 +95,7 @@ A line of key hints shows at the bottom while the roster has focus. With a borde
 
 To hide a shown worker, press `Enter` on it or minimize its pane: the roster turns a minimized worker back into a hidden one. Closing a worker's pane ends the worker.
 
-The layer's height follows the lines the workers take, plus the hints line while focused. If the roster never gets a worker, it exits after 30 seconds.
+The layer's height follows the lines the workers take, plus the hints line while focused, up to 60% of the window's height. If the roster's pane is narrower than 50 columns, the roster widens it to 50, growing to the left so it stays in the corner. It never narrows a pane you have widened. If the roster never gets a worker, it exits after 30 seconds.
 
 The spinner redraws every 100 ms while any worker is working. Otherwise the roster wakes once a second to update the times.
 
@@ -157,6 +155,10 @@ cargo test --locked
 cargo deny check
 ```
 
+`rust-toolchain.toml` pins the Rust version for development and CI. CI also runs the tests on the minimum version, Rust 1.89.
+
 The tests replay `rex events --json` output recorded in `testdata/` and never call `rex`.
+
+## Licence
 
 Licensed under either of MIT or Apache-2.0, at your option.
