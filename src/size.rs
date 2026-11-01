@@ -82,6 +82,39 @@ pub fn new_height(want: u16, rows: u16, per_row: f64, y: f64, h: f64) -> Option<
     ((target - h).abs() > 1e-6).then_some(target)
 }
 
+/// One row's share of the window height, learned from the layer's own
+/// resizes.
+///
+/// The first guess comes from the lead's pane, whose height includes its
+/// title bar, so a short lead guesses too high: each resize then moves the
+/// layer by more than a row and it never settles on the wanted count. Once a
+/// resize has changed the roster's rows, the height and row change between
+/// two measurements give the real figure.
+#[derive(Debug, Default)]
+pub struct RowScale {
+    last: Option<(f64, u16)>,
+    learned: Option<f64>,
+}
+
+impl RowScale {
+    /// Note the layer's height `h` and its terminal's `rows`, and return the
+    /// row height to use: the learned one, or `guess` until there is one.
+    pub fn observe(&mut self, h: f64, rows: u16, guess: f64) -> f64 {
+        if let Some((last_h, last_rows)) = self.last
+            && last_rows != rows
+        {
+            let est = (h - last_h) / (f64::from(rows) - f64::from(last_rows));
+            // A height read before the terminal caught up gives nonsense;
+            // keep only figures within reach of the guess.
+            if est.is_finite() && est > guess / 10.0 && est < guess * 10.0 {
+                self.learned = Some(est);
+            }
+        }
+        self.last = Some((h, rows));
+        self.learned.unwrap_or(guess)
+    }
+}
+
 /// The new layer `x` and width when the roster has fewer than `MIN_COLUMNS`
 /// columns, or `None` when it has enough (or can't grow).
 ///
@@ -107,6 +140,45 @@ mod tests {
     use super::*;
 
     const PER: f64 = 0.02; // 50 rows in the window
+
+    #[test]
+    fn row_scale_learns_from_a_resize() {
+        let mut scale = RowScale::default();
+        assert_eq!(scale.observe(0.06, 2, 0.036), 0.036);
+        // 0.06 more height gave 3 more rows: 0.02 a row.
+        let per = scale.observe(0.12, 5, 0.036);
+        assert!((per - 0.02).abs() < 1e-9, "{per}");
+        // Same rows again: nothing new to learn, keep the figure.
+        let per = scale.observe(0.12, 5, 0.036);
+        assert!((per - 0.02).abs() < 1e-9, "{per}");
+    }
+
+    #[test]
+    fn row_scale_ignores_a_stale_reading() {
+        let mut scale = RowScale::default();
+        scale.observe(0.06, 2, 0.036);
+        // Rows changed but the height reads the same: not a real figure.
+        assert_eq!(scale.observe(0.06, 5, 0.036), 0.036);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn settles_when_the_lead_guesses_twice_the_row_height() {
+        // A short lead guesses 0.036 a row; a row is really 0.018, under
+        // 0.05 of window chrome. Without learning this bounces 5, 3, 5.
+        let (real, chrome, guess) = (0.018, 0.05, 0.036);
+        let rows_at = |h: f64| ((h - chrome) / real).floor() as u16;
+        let mut scale = RowScale::default();
+        let mut h = 0.06;
+        for _ in 0..4 {
+            let per = scale.observe(h, rows_at(h), guess);
+            match new_height(4, rows_at(h), per, 0.02, h) {
+                Some(next) => h = next,
+                None => break,
+            }
+        }
+        assert_eq!(rows_at(h), 4, "{h}");
+    }
 
     #[test]
     fn widens_a_narrow_layer_to_the_left() {
