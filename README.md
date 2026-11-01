@@ -1,14 +1,22 @@
 # rexroster
 
-A small terminal UI that lists a Rex lead's worker sessions. Workers run as detached Rex blocks, so they take no space on screen. The roster sits in a floating pane in the top-right corner of the lead's tab. It shows each worker's state, and from the list you can show or hide any worker.
+rexroster is a small terminal UI and command-line tool for [Rex](https://www.superlogical.com/rex), a terminal multiplexer made by Superlogical. It is for people who run one "lead" Claude Code session that starts other Claude Code sessions as workers. Each worker runs in a detached Rex block, so it takes no space on screen; rexroster lists the lead's workers in a small floating pane, shows what each one is doing, and brings a worker into view when it is waiting on a prompt.
 
-It works on macOS and Linux. It needs the `rex` CLI, which it finds at `$REX_BIN_DIR/rex` (Rex sets this in every terminal) or on `PATH`.
+Claude Code tells Rex what it is doing (working, waiting on a prompt, done) through Rex's [program status protocol](https://www.superlogical.com/rex/docs/build/program-status), and the roster shows that state for each worker. Any other program that sends those records works the same way.
+
+## Requirements
+
+- Rex, with its `rex` CLI. rexroster finds it at `$REX_BIN_DIR/rex` (Rex sets this in every terminal) or on `PATH`. Rex is in beta; see its [installation page](https://www.superlogical.com/rex/docs/installation).
+- macOS or Linux.
+- Rust 1.89 or later, to build it.
 
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --locked --git https://github.com/ryanlewis/rexroster
 ```
+
+or, from a clone, `cargo install --locked --path .`.
 
 ## Typical use
 
@@ -82,7 +90,7 @@ The layer's height follows the lines the workers take, plus the hints line while
 
 The spinner redraws every 100 ms while any worker is working. Otherwise the roster wakes once a second to update the times.
 
-Focus key: `cmd+alt+R` (physical key `KeyR`, action `roster_toggle`) switches focus between the lead and its roster. The binding lives in Rex's `init.lua`. After you change that file, for example with a dotfiles tool such as chezmoi, run `rex config reload`.
+rexroster has no key binding of its own. To move focus between a lead and its roster from the keyboard, add a [custom action](https://www.superlogical.com/rex/docs/customize/actions) to Rex's `init.lua` that finds the block labelled `roster-<last 6 characters of the lead id>` in the active window and focuses it with `rex.session.focus_block`, bind it with `rex.bind`, then run `rex config reload`.
 
 ## The watcher
 
@@ -104,7 +112,9 @@ The watcher runs until the Rex server goes away or the process is killed. It rea
 
 ### Notifications
 
-With `notify = "cases"`, the watcher also opens a "stuck" case with the prompt's message when it floats a worker, and withdraws the case when the worker sinks. This needs an external `cases` CLI on `PATH`; rexroster does not provide it. With `notify = "none"` (the default) the watcher only floats and sinks.
+Notifications are optional and off by default. With `notify = "none"` (the default) the watcher only floats and sinks.
+
+With `notify = "cases"`, the watcher also runs a separate `cases` CLI: it opens a "stuck" case with the prompt's message when it floats a worker (`cases open --kind stuck …`), and withdraws the case when the worker sinks (`cases withdraw`). rexroster does not provide `cases`; leave this off unless you have a tool by that name that takes those commands.
 
 ## Options
 
