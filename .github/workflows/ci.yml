@@ -22,7 +22,9 @@ jobs:
   lint:
     name: fmt and clippy
     # Linux is enough: the code is Unix-only and has no macOS-specific paths.
-    runs-on: ${{ vars.BERT == 'on' && fromJSON('["self-hosted","bert","medium"]') || 'ubuntu-latest' }}
+    # The repo variable BERT=on sends jobs to a self-hosted runner. Pull
+    # requests from forks never use it: they always get ubuntu-latest.
+    runs-on: ${{ vars.BERT == 'on' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","bert","medium"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,16 +32,16 @@ jobs:
       - run: rustup toolchain install stable --profile minimal -c rustfmt,clippy && rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          cache-targets: ${{ vars.BERT != 'on' }}
+          cache-targets: ${{ !(vars.BERT == 'on' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
-    # The repo variable BERT=on sends the Ubuntu leg to the self-hosted runner
-    # on bert, which caches dependencies but not target/.
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && vars.BERT == 'on' && fromJSON('["self-hosted","bert","medium"]') || matrix.os }}
+    # BERT=on sends the Ubuntu leg to the self-hosted runner, which caches
+    # dependencies but not target/. Fork pull requests never use it.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && vars.BERT == 'on' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","bert","medium"]') || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -53,13 +55,14 @@ jobs:
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          cache-targets: ${{ !(matrix.os == 'ubuntu-latest' && vars.BERT == 'on') }}
+          cache-targets: ${{ !(matrix.os == 'ubuntu-latest' && vars.BERT == 'on' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --locked
 
   deny:
     name: cargo deny
-    runs-on: ${{ vars.BERT == 'on' && fromJSON('["self-hosted","bert","small"]') || 'ubuntu-latest' }}
+    # Fork pull requests never use the self-hosted runner.
+    runs-on: ${{ vars.BERT == 'on' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","bert","small"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
