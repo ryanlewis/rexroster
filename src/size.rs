@@ -9,6 +9,9 @@
 pub const MAX_HEIGHT: f64 = 0.6;
 /// The fewest rows the layer shrinks to: one line plus about a row of window chrome.
 pub const MIN_ROWS: f64 = 2.0;
+/// The fewest columns the roster's terminal should have. Below this, a
+/// compact row has little room left for the message.
+pub const MIN_COLUMNS: u16 = 50;
 
 use std::time::Duration;
 
@@ -79,11 +82,58 @@ pub fn new_height(want: u16, rows: u16, per_row: f64, y: f64, h: f64) -> Option<
     ((target - h).abs() > 1e-6).then_some(target)
 }
 
+/// The new layer `x` and width when the roster has fewer than `MIN_COLUMNS`
+/// columns, or `None` when it has enough (or can't grow).
+///
+/// - `cols`: columns its terminal has now.
+/// - `per_col`: one column's share of the window width, from the lead's pane.
+/// - `x`, `w`: the layer's current left edge and width, as window fractions.
+///
+/// The layer grows to the left, keeping its right edge, and stops at the
+/// window's left edge. It never shrinks, so a layer widened by hand keeps its
+/// width.
+pub fn new_width(cols: u16, per_col: f64, x: f64, w: f64) -> Option<(f64, f64)> {
+    let missing = f64::from(MIN_COLUMNS.saturating_sub(cols));
+    if missing == 0.0 || per_col <= 0.0 || !per_col.is_finite() {
+        return None;
+    }
+    let right = x + w;
+    let target = (w + missing * per_col).min(right);
+    ((target - w).abs() > 1e-6).then_some((right - target, target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const PER: f64 = 0.02; // 50 rows in the window
+
+    #[test]
+    fn widens_a_narrow_layer_to_the_left() {
+        // 100 columns in the window: 20 columns at 0.20 wide.
+        let (x, w) = new_width(20, 0.01, 0.72, 0.20).unwrap();
+        assert!((w - 0.50).abs() < 1e-9, "{w}");
+        assert!((x + w - 0.92).abs() < 1e-9, "right edge moved: {x}");
+    }
+
+    #[test]
+    fn leaves_a_wide_enough_layer_alone() {
+        assert_eq!(new_width(MIN_COLUMNS, 0.01, 0.5, 0.5), None);
+        assert_eq!(new_width(80, 0.01, 0.2, 0.8), None);
+    }
+
+    #[test]
+    fn widens_no_further_than_the_left_edge() {
+        // 40 columns in the whole window.
+        assert_eq!(new_width(10, 0.025, 0.7, 0.25), Some((0.0, 0.95)));
+        assert_eq!(new_width(38, 0.025, 0.0, 0.95), None);
+    }
+
+    #[test]
+    fn ignores_a_bad_column_width() {
+        assert_eq!(new_width(10, 0.0, 0.7, 0.25), None);
+        assert_eq!(new_width(10, f64::NAN, 0.7, 0.25), None);
+    }
 
     #[test]
     fn stops_when_the_difference_is_zero() {
