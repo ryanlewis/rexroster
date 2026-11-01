@@ -46,6 +46,8 @@ impl Record {
 pub struct Meta {
     pub lead: String,
     pub task: Option<String>,
+    /// The worker's working directory, when its record carries one.
+    pub cwd: Option<String>,
 }
 
 impl Meta {
@@ -60,8 +62,52 @@ impl Meta {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
+            cwd: v["cwd"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
         })
     }
+}
+
+/// `msg` with the worker's `cwd` shortened: a leading `cd <cwd> && ` or
+/// `cd <cwd>; ` (after an optional `Running `) is dropped, and the path
+/// elsewhere becomes `.`. Only whole path segments match, so `/a/b` leaves
+/// `/a/bc` alone.
+pub fn strip_cwd(msg: &str, cwd: &str) -> String {
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        return msg.to_owned();
+    }
+    let (lead, rest) = match msg.strip_prefix("Running ") {
+        Some(r) => ("Running ", r),
+        None => ("", msg),
+    };
+    let rest = rest
+        .strip_prefix("cd ")
+        .and_then(|r| r.strip_prefix(cwd))
+        .and_then(|r| r.strip_prefix(" && ").or_else(|| r.strip_prefix("; ")))
+        .map_or(rest, str::trim_start);
+    let path_char = |c: char| c.is_alphanumeric() || "_-.~".contains(c);
+    let mut out = String::with_capacity(msg.len());
+    out.push_str(lead);
+    let mut last = 0;
+    for (i, _) in rest.match_indices(cwd) {
+        let end = i + cwd.len();
+        let before = rest[..i].chars().next_back();
+        let after = rest[end..].chars().next();
+        if i < last || before.is_some_and(|c| path_char(c) || c == '/') {
+            continue;
+        }
+        if after.is_some_and(path_char) {
+            continue;
+        }
+        out.push_str(&rest[last..i]);
+        out.push('.');
+        last = end;
+    }
+    out.push_str(&rest[last..]);
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -258,17 +304,25 @@ impl Model {
         self.workers()
             .map(|(id, b)| {
                 let root = b.records.get("");
-                let task = b.meta().and_then(|m| m.task);
+                let meta = b.meta();
+                let task = meta.as_ref().and_then(|m| m.task.clone());
+                let cwd = meta.and_then(|m| m.cwd);
                 Row {
                     block: id.clone(),
                     label: b.label.clone(),
                     shown: b.placed,
                     state: root.map_or_else(|| "starting".to_owned(), |r| r.state.clone()),
                     age: b.since.map(|s| now.saturating_sub(s)),
-                    msg: root
-                        .and_then(|r| r.msg.clone())
-                        .or_else(|| task.clone())
-                        .unwrap_or_default(),
+                    msg: {
+                        let msg = root
+                            .and_then(|r| r.msg.clone())
+                            .or_else(|| task.clone())
+                            .unwrap_or_default();
+                        match cwd {
+                            Some(cwd) => strip_cwd(&msg, &cwd),
+                            None => msg,
+                        }
+                    },
                     task,
                 }
             })
@@ -375,6 +429,64 @@ mod tests {
     fn meta(block: &str, lead: &str, task: Option<&str>) -> Event {
         let msg = json!({ "lead": lead, "task": task }).to_string();
         status(block, "meta", "rexlead", "idle", Some(&msg))
+    }
+
+    const CWD: &str = "/home/u/proj/.worktrees/feat-x";
+
+    #[test]
+    fn strip_cwd_drops_a_leading_cd_and_shortens_paths() {
+        // Prefix dropped, with `&&` or `;`, with and without `Running `.
+        assert_eq!(
+            strip_cwd(&format!("Running cd {CWD}; sed -n 1p a.rs"), CWD),
+            "Running sed -n 1p a.rs"
+        );
+        assert_eq!(
+            strip_cwd(&format!("cd {CWD} && cargo test"), CWD),
+            "cargo test"
+        );
+        // A path inside the message becomes `.`.
+        assert_eq!(
+            strip_cwd(&format!("Reading {CWD}/src/main.rs"), CWD),
+            "Reading ./src/main.rs"
+        );
+        assert_eq!(strip_cwd(&format!("ls {CWD} {CWD}/a"), CWD), "ls . ./a");
+        assert_eq!(strip_cwd(&format!("cd {CWD}"), CWD), "cd .");
+        // A trailing slash on the cwd makes no difference.
+        assert_eq!(
+            strip_cwd(&format!("ls {CWD}/a"), &format!("{CWD}/")),
+            "ls ./a"
+        );
+    }
+
+    #[test]
+    fn strip_cwd_matches_whole_segments_only() {
+        assert_eq!(
+            strip_cwd("ls /a/bc /x/a/b /a/b-c /a/b", "/a/b"),
+            "ls /a/bc /x/a/b /a/b-c ."
+        );
+        assert_eq!(
+            strip_cwd(&format!("cd {CWD}x && ls"), CWD),
+            format!("cd {CWD}x && ls")
+        );
+        assert_eq!(strip_cwd("ls /a", "/"), "ls /a");
+        assert_eq!(strip_cwd("ls /a", ""), "ls /a");
+    }
+
+    #[test]
+    fn rows_rewrite_the_cwd_only_when_the_meta_record_has_one() {
+        let text = format!("Running cd {CWD}; ls");
+        let working = |b: &str| status(b, "", "claude-code", "working", Some(&text));
+        let mut m = Model::new(LEAD.into(), None, 0);
+        let with = json!({ "lead": LEAD, "task": null, "cwd": CWD }).to_string();
+        m.apply(status("block:a", "meta", "rexlead", "idle", Some(&with)), 0);
+        m.apply(working("block:a"), 0);
+        // An old record has no `cwd`: the message is left alone.
+        m.apply(meta("block:b", LEAD, None), 0);
+        m.apply(working("block:b"), 0);
+        let rows = m.rows(0);
+        let msg = |b: &str| rows.iter().find(|r| r.block == b).unwrap().msg.clone();
+        assert_eq!(msg("block:a"), "Running ls");
+        assert_eq!(msg("block:b"), text);
     }
 
     #[test]

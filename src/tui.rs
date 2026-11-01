@@ -766,9 +766,16 @@ pub fn wrap(text: &str, width: usize, max: usize) -> Vec<String> {
     if width == 0 || max == 0 {
         return Vec::new();
     }
+    // A message that already ends in a word of its own, `…`, would wrap onto a
+    // line by itself. Take it off and put it back on the last line after.
+    let body = text.trim_end();
+    let (body, open) = match body.strip_suffix('…') {
+        Some(b) if b.ends_with(char::is_whitespace) && !b.trim().is_empty() => (b, true),
+        _ => (text, false),
+    };
     let mut lines: Vec<String> = Vec::new();
     let mut line = String::new();
-    for word in text.split_whitespace() {
+    for word in body.split_whitespace() {
         let mut word = word.to_owned();
         loop {
             let need = if line.is_empty() {
@@ -801,6 +808,12 @@ pub fn wrap(text: &str, width: usize, max: usize) -> Vec<String> {
         // so joining them always overflows and `cut` adds the ellipsis.
         let rest = lines.split_off(max - 1).join(" ");
         lines.push(cut(&rest, width));
+    }
+    if open && let Some(last) = lines.last_mut() {
+        // Ends the last text line, replacing its final character if it is full.
+        if !last.ends_with('…') {
+            *last = cut(&format!("{last}…"), width);
+        }
     }
     lines
 }
@@ -1333,6 +1346,36 @@ mod tests {
             ["aa bb", "cc dd", "ee f…"]
         );
         assert_eq!(wrap("text", 0, 3), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ellipsis_never_sits_alone_on_a_line() {
+        let path = "/home/u/dev/smd/.worktrees/feat-max-width;";
+        let w = path.width();
+        let cut_path = "/home/u/dev/smd/.worktrees/feat-max-width…";
+        // The message ends in an ellipsis word after a long unbreakable word:
+        // the last line is full, so its final character gives way.
+        let msg = format!("Running cd {path} …");
+        assert_eq!(wrap(&msg, w, 3), ["Running cd", cut_path]);
+        // Room on the last line: the ellipsis is appended.
+        assert_eq!(
+            wrap(&msg, w + 5, 3),
+            ["Running cd".to_owned(), format!("{path}…")]
+        );
+        // Our own cut, with the last kept line full of one long word.
+        let msg = format!("Running cd {path} sed -n 1,40p");
+        assert_eq!(wrap(&msg, w, 2), ["Running cd", cut_path]);
+        assert_eq!(wrap("abcd efgh …", 4, 2), ["abcd", "efg…"]);
+        // A message that is only an ellipsis stays as it is.
+        assert_eq!(wrap("…", 4, 3), ["…"]);
+        // Compact view: `cut` puts the ellipsis on the text.
+        assert_eq!(cut("abcdef …", 6), "abcde…");
+        assert_eq!(cut("abc …", 5), "abc …");
+    }
+
+    #[test]
+    fn ellipsis_word_over_the_line_cap_is_not_added_twice() {
+        assert_eq!(wrap("aa bb cc dd …", 5, 2), ["aa bb", "cc d…"]);
     }
 
     fn tasked(label: &str, msg: &str, task: Option<&str>) -> Row {
