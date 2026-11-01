@@ -705,9 +705,11 @@ impl App<'_> {
         };
         self.list_area = list;
         let sel = self.selected_index(rows);
+        // The selection only matters to keys and clicks, so mark it only
+        // while the roster has focus. It still decides the scroll below.
         let laid = layout(
             rows,
-            sel,
+            sel.filter(|_| self.focused),
             area.width,
             self.spin_start.elapsed(),
             self.expanded(),
@@ -1090,7 +1092,7 @@ mod tests {
         assert_eq!(
             render_at(&mut a, &rows, 40, 4),
             [
-                "›⠋▸ alpha      1m Running tests         ",
+                " ⠋▸ alpha      1m Running tests         ",
                 " ✓  beta       5s PR raised             ",
                 " ◐  gamma-long 1h Allow git push to the…",
                 "                                        ",
@@ -1141,7 +1143,7 @@ mod tests {
             "hi",
         )];
         let line = render_at(&mut a, &rows, 30, 1);
-        assert_eq!(line, "›○  a-very-long-worker-… hi   ");
+        assert_eq!(line, " ○  a-very-long-worker-… hi   ");
     }
 
     #[test]
@@ -1161,6 +1163,19 @@ mod tests {
     }
 
     #[test]
+    fn chevron_shows_only_while_focused() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let rows = [worker("alpha", "idle", false, Some(5), "hi")];
+        assert!(render_at(&mut a, &rows, 30, 1).starts_with(" ○  alpha"));
+        a.on_terminal_event(&TermEvent::FocusGained, &rows);
+        let screen = render_at(&mut a, &rows, 30, 2);
+        assert!(screen.starts_with("›○  alpha"), "{screen}");
+        a.on_terminal_event(&TermEvent::FocusLost, &rows);
+        assert!(render_at(&mut a, &rows, 30, 1).starts_with(" ○  alpha"));
+    }
+
+    #[test]
     fn scrolls_to_keep_the_selection_visible() {
         let rex = Fake::default();
         let mut a = app(&rex);
@@ -1171,7 +1186,7 @@ mod tests {
         a.selected = Some("block:a3".into());
         let screen = render_at(&mut a, &rows, 12, 2);
         assert!(
-            screen.lines().nth(1).unwrap().starts_with("›○  a3"),
+            screen.lines().nth(1).unwrap().starts_with(" ○  a3"),
             "{screen}"
         );
         assert_eq!(a.offset, 1);
@@ -1500,7 +1515,7 @@ mod tests {
         assert_eq!(
             render_at(&mut a, &rows, 25, 6),
             [
-                "›◐  alpha  5s            ",
+                " ◐  alpha  5s            ",
                 "    Allow git push to the",
                 "    remote branch now?   ",
                 "    fix login            ",
@@ -1589,7 +1604,7 @@ mod tests {
         a.selected = Some("block:beta".into());
         let screen = render_at(&mut a, &rows, 24, 3);
         assert!(
-            screen.lines().next().unwrap().starts_with("›◐  beta"),
+            screen.lines().next().unwrap().starts_with(" ◐  beta"),
             "{screen}"
         );
     }
