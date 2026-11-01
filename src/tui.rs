@@ -106,6 +106,7 @@ struct App<'a> {
     /// press only, so an unrelated refresh can't hide it.
     config_error: Option<String>,
     fit: Fit,
+    row_scale: size::RowScale,
     /// The `session.view` this pass fetched, so a fit in the same pass
     /// needn't fetch it again. Dropped before the loop waits.
     view: Option<Value>,
@@ -215,6 +216,7 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         error: None,
         config_error: settings.error,
         fit: Fit::default(),
+        row_scale: size::RowScale::default(),
         view: None,
         spin_start: Instant::now(),
         opts: settings.opts,
@@ -432,7 +434,9 @@ impl App<'_> {
         let my_size = self.rex.block_call(&self.session, me, "size").ok()?;
         let lead_rows = rex::drawn_rows(&lead_size)?;
         let rows = rex::drawn_rows(&my_size)?;
-        let per_row = lead_h / f64::from(lead_rows);
+        let per_row = self
+            .row_scale
+            .observe(bounds[3], rows, lead_h / f64::from(lead_rows));
         let new_h = size::new_height(self.fit.want, rows, per_row, bounds[1], bounds[3]);
         // Older Rex servers may not report columns; then only the height fits.
         let new_w = (|| {
@@ -1050,6 +1054,7 @@ mod tests {
             error: None,
             config_error: None,
             fit: Fit::default(),
+            row_scale: size::RowScale::default(),
             view: None,
             spin_start: Instant::now(),
             opts: Options::default(),
