@@ -25,7 +25,7 @@ const SCRIPT: &str = include_str!("../lua/blocked-float.lua");
 
 /// The script to run: a line that sets `NOTIFY`, then the built-in script.
 pub fn script(notify: Notify) -> String {
-    format!("NOTIFY = \"{}\"\n{SCRIPT}", notify.as_str())
+    format!("NOTIFY = \"{}\"\n{SCRIPT}", notify)
 }
 
 /// The watcher's lock file for the current Rex server.

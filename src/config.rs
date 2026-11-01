@@ -34,7 +34,7 @@ pub enum View {
 }
 
 /// What the watcher does besides floating a blocked worker into view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum Notify {
     #[default]
     None,
@@ -42,72 +42,31 @@ pub enum Notify {
     Cases,
 }
 
-/// Lowercase names, as written in the file and on the command line.
-trait Named: Sized + Copy + PartialEq + 'static {
-    const ALL: &'static [Self];
-    fn name(self) -> &'static str;
-
-    fn parse(s: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|v| v.name() == s)
-    }
-
-    /// The next (or previous) value, wrapping round.
-    fn step(self, by: isize) -> Self {
-        let all = Self::ALL;
-        let i = all.iter().position(|v| *v == self).unwrap_or(0);
-        let len = isize::try_from(all.len()).unwrap_or(1);
-        let j = (isize::try_from(i).unwrap_or(0) + by).rem_euclid(len);
-        all[usize::try_from(j).unwrap_or(0)]
-    }
+/// The value named `s`, if any.
+fn parse_name<T: ValueEnum>(s: &str) -> Option<T> {
+    T::from_str(s, false).ok()
 }
 
-impl Named for Border {
-    const ALL: &'static [Self] = &[Border::None, Border::Rounded];
-    fn name(self) -> &'static str {
-        match self {
-            Border::None => "none",
-            Border::Rounded => "rounded",
+/// The next (or previous) value, wrapping round.
+fn step<T: ValueEnum + PartialEq + Copy>(v: T, by: isize) -> T {
+    let all = T::value_variants();
+    let i = all.iter().position(|x| *x == v).unwrap_or(0);
+    let len = isize::try_from(all.len()).unwrap_or(1);
+    let j = (isize::try_from(i).unwrap_or(0) + by).rem_euclid(len);
+    all[usize::try_from(j).unwrap_or(0)]
+}
+
+macro_rules! display_by_name {
+    ($($t:ty),*) => {$(
+        impl fmt::Display for $t {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(self.to_possible_value().expect("no value is skipped").get_name())
+            }
         }
-    }
+    )*};
 }
 
-impl Named for View {
-    const ALL: &'static [Self] = &[View::Compact, View::Expanded];
-    fn name(self) -> &'static str {
-        match self {
-            View::Compact => "compact",
-            View::Expanded => "expanded",
-        }
-    }
-}
-
-impl Named for Notify {
-    const ALL: &'static [Self] = &[Notify::None, Notify::Cases];
-    fn name(self) -> &'static str {
-        match self {
-            Notify::None => "none",
-            Notify::Cases => "cases",
-        }
-    }
-}
-
-impl Notify {
-    pub fn as_str(self) -> &'static str {
-        self.name()
-    }
-}
-
-impl fmt::Display for Border {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl fmt::Display for View {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
+display_by_name!(Border, View, Notify);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
@@ -162,12 +121,12 @@ impl Options {
         }
     }
 
-    pub fn value(&self, key: Key) -> &'static str {
+    pub fn value(&self, key: Key) -> String {
         match key {
-            Key::Border => self.border.name(),
-            Key::View => self.view.name(),
-            Key::Watch => bool_name(self.watch),
-            Key::Notify => self.notify.name(),
+            Key::Border => self.border.to_string(),
+            Key::View => self.view.to_string(),
+            Key::Watch => self.watch.to_string(),
+            Key::Notify => self.notify.to_string(),
         }
     }
 
@@ -182,16 +141,12 @@ impl Options {
     /// Move `key` to its next (or previous) value.
     pub fn cycle(&mut self, key: Key, by: isize) {
         match key {
-            Key::Border => self.border = self.border.step(by),
-            Key::View => self.view = self.view.step(by),
+            Key::Border => self.border = step(self.border, by),
+            Key::View => self.view = step(self.view, by),
             Key::Watch => self.watch = !self.watch,
-            Key::Notify => self.notify = self.notify.step(by),
+            Key::Notify => self.notify = step(self.notify, by),
         }
     }
-}
-
-fn bool_name(b: bool) -> &'static str {
-    if b { "true" } else { "false" }
 }
 
 /// Parse the file's text. Missing keys are defaults; unknown keys are ignored.
@@ -202,12 +157,12 @@ pub fn parse(text: &str) -> Result<Options> {
     let mut opts = Options::default();
     if let Some(item) = doc.get("border") {
         let s = item.as_str().unwrap_or_default();
-        opts.border = Border::parse(s)
+        opts.border = parse_name(s)
             .with_context(|| format!("border must be \"none\" or \"rounded\", not {item}"))?;
     }
     if let Some(item) = doc.get("view") {
         let s = item.as_str().unwrap_or_default();
-        opts.view = View::parse(s)
+        opts.view = parse_name(s)
             .with_context(|| format!("view must be \"compact\" or \"expanded\", not {item}"))?;
     }
     if let Some(item) = doc.get("watch") {
@@ -217,7 +172,7 @@ pub fn parse(text: &str) -> Result<Options> {
     }
     if let Some(item) = doc.get("notify") {
         let s = item.as_str().unwrap_or_default();
-        opts.notify = Notify::parse(s)
+        opts.notify = parse_name(s)
             .with_context(|| format!("notify must be \"none\" or \"cases\", not {item}"))?;
     }
     Ok(opts)
@@ -465,7 +420,7 @@ mod tests {
 
     #[test]
     fn save_keeps_a_comment_on_the_changed_key() {
-        // Review finding: the trailing comment was dropped.
+        // A trailing comment on the changed line is kept.
         let dir = temp_dir("comment");
         let file = dir.join("config.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -520,7 +475,7 @@ mod tests {
 
     #[test]
     fn load_strict_refuses_a_bad_file() {
-        // Review finding: `watch = false` beside a typo fell back to watch = true.
+        // `watch = false` beside a typo must not fall back to watch = true.
         let dir = temp_dir("strict");
         let file = dir.join("config.toml");
         assert!(load_strict(Some(&file)).unwrap().watch);
