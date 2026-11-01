@@ -1,9 +1,11 @@
-//! Display options, kept in `$XDG_CONFIG_HOME/rexroster/config.toml`
+//! Options, kept in `$XDG_CONFIG_HOME/rexroster/config.toml`
 //! (`~/.config/rexroster/config.toml` when that is unset).
 //!
 //! ```toml
 //! border = "rounded"   # or "none" (the default)
 //! view = "expanded"    # or "compact" (the default)
+//! watch = false        # or true (the default): open and spawn start the watcher
+//! notify = "cases"     # or "none" (the default): what the watcher does besides floating
 //! ```
 //!
 //! A missing file or key means the default, and unknown keys are ignored.
@@ -29,6 +31,15 @@ pub enum View {
     #[default]
     Compact,
     Expanded,
+}
+
+/// What the watcher does besides floating a blocked worker into view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Notify {
+    #[default]
+    None,
+    /// Open a case with the `cases` CLI, and withdraw it when the worker moves on.
+    Cases,
 }
 
 /// Lowercase names, as written in the file and on the command line.
@@ -70,6 +81,22 @@ impl Named for View {
     }
 }
 
+impl Named for Notify {
+    const ALL: &'static [Self] = &[Notify::None, Notify::Cases];
+    fn name(self) -> &'static str {
+        match self {
+            Notify::None => "none",
+            Notify::Cases => "cases",
+        }
+    }
+}
+
+impl Notify {
+    pub fn as_str(self) -> &'static str {
+        self.name()
+    }
+}
+
 impl fmt::Display for Border {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(self.name())
@@ -82,11 +109,25 @@ impl fmt::Display for View {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     pub border: Border,
     /// The view the roster starts in.
     pub view: View,
+    /// Whether `open` and `spawn` start the watcher.
+    pub watch: bool,
+    pub notify: Notify,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            border: Border::default(),
+            view: View::default(),
+            watch: true,
+            notify: Notify::default(),
+        }
+    }
 }
 
 /// One option, as listed in the options panel.
@@ -94,15 +135,19 @@ pub struct Options {
 pub enum Key {
     Border,
     View,
+    Watch,
+    Notify,
 }
 
 impl Key {
-    pub const ALL: [Key; 2] = [Key::Border, Key::View];
+    pub const ALL: [Key; 4] = [Key::Border, Key::View, Key::Watch, Key::Notify];
 
     pub fn name(self) -> &'static str {
         match self {
             Key::Border => "border",
             Key::View => "view",
+            Key::Watch => "watch",
+            Key::Notify => "notify",
         }
     }
 }
@@ -113,6 +158,7 @@ impl Options {
         Self {
             border: border.unwrap_or(self.border),
             view: view.unwrap_or(self.view),
+            ..self
         }
     }
 
@@ -120,6 +166,16 @@ impl Options {
         match key {
             Key::Border => self.border.name(),
             Key::View => self.view.name(),
+            Key::Watch => bool_name(self.watch),
+            Key::Notify => self.notify.name(),
+        }
+    }
+
+    /// `key`'s value as written in the file: `watch` is a boolean, the rest strings.
+    fn toml_value(&self, key: Key) -> toml_edit::Item {
+        match key {
+            Key::Watch => value(self.watch),
+            _ => value(self.value(key)),
         }
     }
 
@@ -128,8 +184,14 @@ impl Options {
         match key {
             Key::Border => self.border = self.border.step(by),
             Key::View => self.view = self.view.step(by),
+            Key::Watch => self.watch = !self.watch,
+            Key::Notify => self.notify = self.notify.step(by),
         }
     }
+}
+
+fn bool_name(b: bool) -> &'static str {
+    if b { "true" } else { "false" }
 }
 
 /// Parse the file's text. Missing keys are defaults; unknown keys are ignored.
@@ -147,6 +209,16 @@ pub fn parse(text: &str) -> Result<Options> {
         let s = item.as_str().unwrap_or_default();
         opts.view = View::parse(s)
             .with_context(|| format!("view must be \"compact\" or \"expanded\", not {item}"))?;
+    }
+    if let Some(item) = doc.get("watch") {
+        opts.watch = item
+            .as_bool()
+            .with_context(|| format!("watch must be true or false, not {item}"))?;
+    }
+    if let Some(item) = doc.get("notify") {
+        let s = item.as_str().unwrap_or_default();
+        opts.notify = Notify::parse(s)
+            .with_context(|| format!("notify must be \"none\" or \"cases\", not {item}"))?;
     }
     Ok(opts)
 }
@@ -202,7 +274,7 @@ pub fn save(path: &Path, opts: &Options, keys: &[Key]) -> Result<()> {
         bail!("{} is not valid TOML, so it was not saved", path.display());
     };
     for key in keys {
-        let mut new = value(opts.value(*key));
+        let mut new = opts.toml_value(*key);
         // Keep any comment or spacing around the old value.
         if let (Some(old), Some(v)) = (
             doc.get(key.name()).and_then(|i| i.as_value()),
@@ -238,14 +310,16 @@ mod tests {
             parse("border = \"rounded\"\n").unwrap(),
             Options {
                 border: Border::Rounded,
-                view: View::Compact
+                view: View::Compact,
+                ..Options::default()
             }
         );
         assert_eq!(
             parse("border = \"none\"\nview = \"expanded\"\n").unwrap(),
             Options {
                 border: Border::None,
-                view: View::Expanded
+                view: View::Expanded,
+                ..Options::default()
             }
         );
     }
@@ -285,13 +359,15 @@ mod tests {
         let file = Options {
             border: Border::Rounded,
             view: View::Expanded,
+            ..Options::default()
         };
         assert_eq!(file.with_flags(None, None), file);
         assert_eq!(
             file.with_flags(Some(Border::None), None),
             Options {
                 border: Border::None,
-                view: View::Expanded
+                view: View::Expanded,
+                ..Options::default()
             }
         );
         assert_eq!(
@@ -318,6 +394,7 @@ mod tests {
         let opts = Options {
             border: Border::Rounded,
             view: View::Expanded,
+            ..Options::default()
         };
         // Creates the directory; writes only the keys asked for.
         save(&file, &opts, &[Key::Border]).unwrap();
@@ -392,6 +469,42 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "border = \"rounded\"  # keep it clean\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parses_watch_and_notify() {
+        let d = parse("").unwrap();
+        assert!(d.watch);
+        assert_eq!(d.notify, Notify::None);
+        let o = parse("watch = false\nnotify = \"cases\"\n").unwrap();
+        assert!(!o.watch);
+        assert_eq!(o.notify, Notify::Cases);
+        assert!(parse("watch = \"no\"").is_err());
+        assert!(parse("notify = \"email\"").is_err());
+        // Flags change only the display options.
+        assert_eq!(
+            o.with_flags(Some(Border::Rounded), None).notify,
+            Notify::Cases
+        );
+    }
+
+    #[test]
+    fn cycles_and_saves_watch_as_a_boolean() {
+        let dir = temp_dir("watch");
+        let file = dir.join("config.toml");
+        let mut o = Options::default();
+        o.cycle(Key::Watch, 1);
+        assert!(!o.watch);
+        assert_eq!(o.value(Key::Watch), "false");
+        o.cycle(Key::Notify, -1);
+        assert_eq!(o.notify, Notify::Cases);
+        save(&file, &o, &[Key::Watch, Key::Notify]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "watch = false\nnotify = \"cases\"\n"
+        );
+        assert_eq!(parse(&std::fs::read_to_string(&file).unwrap()).unwrap(), o);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

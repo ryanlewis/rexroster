@@ -1237,6 +1237,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "clap",
+ "libc",
  "ratatui",
  "serde_json",
  "toml_edit",

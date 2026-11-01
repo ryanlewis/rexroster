@@ -98,6 +98,10 @@ pub enum Command {
         #[arg(last = true, required = true)]
         cmd: Vec<OsString>,
     },
+    /// Float detached workers that are blocked on a prompt into view, and
+    /// sink them when they move on. One runs per user per Rex server; open
+    /// and spawn start it.
+    Watch,
     /// Tag this terminal as a lead's worker, then exec the command.
     Tag {
         /// The lead's block id.
@@ -142,6 +146,13 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn watch_takes_no_arguments() {
+        let cli = Cli::try_parse_from(["rexroster", "watch"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Watch)));
+        assert!(Cli::try_parse_from(["rexroster", "watch", "x"]).is_err());
     }
 
     #[test]

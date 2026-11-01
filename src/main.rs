@@ -2,11 +2,13 @@ mod cli;
 mod config;
 mod events;
 mod launch;
+mod lock;
 mod model;
 mod rex;
 mod size;
 mod tag;
 mod tui;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -27,6 +29,11 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     let display = cli.subcommand_display()?;
+    if let Some(Command::Watch) = cli.command {
+        // The watcher hears every session, so it needs no REX_SESSION.
+        let (opts, _) = config::load(config::path().as_deref());
+        return watch::run(rex::Cli::new().command(), opts.notify, &watch::lock_path());
+    }
     let session = std::env::var("REX_SESSION")
         .ok()
         .filter(|s| !s.is_empty())
@@ -44,9 +51,18 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Open { lead, .. }) => {
             let exe = std::env::current_exe().context("finding rexroster's own path")?;
             let flags = display.to_args();
-            if let Some(layer) = launch::open(&rex::Cli::new(), &session, &lead, &exe, &flags)? {
+            let layer = launch::open(
+                &rex::Cli::new(),
+                &session,
+                &lead,
+                &exe,
+                &flags,
+                &lock::dir(),
+            )?;
+            if let Some(layer) = layer {
                 println!("{layer}");
             }
+            start_watcher(&exe);
             Ok(())
         }
         Some(Command::Spawn {
@@ -65,13 +81,34 @@ fn run(cli: Cli) -> Result<()> {
                 cmd: &cmd,
             };
             let path = std::env::var_os("PATH");
-            let out = launch::spawn(&rex::Cli::new(), &session, &spec, &exe, path.as_ref())?;
+            let out = launch::spawn(
+                &rex::Cli::new(),
+                &session,
+                &spec,
+                &exe,
+                path.as_ref(),
+                &lock::dir(),
+            )?;
             println!("{}", out.json);
             if let Some(err) = out.open_error {
                 eprintln!("rexroster: the worker started, but the roster didn't open: {err}");
             }
+            start_watcher(&exe);
             Ok(())
         }
         Some(Command::Tag { lead, task, cmd }) => tag::run(&lead, task.as_deref(), &cmd),
+        Some(Command::Watch) => unreachable!("handled above"),
+    }
+}
+
+/// Start the watcher in the background when the config wants one. A failure
+/// is a warning: the roster and the worker don't depend on it.
+fn start_watcher(exe: &std::path::Path) {
+    let (opts, _) = config::load(config::path().as_deref());
+    if !opts.watch {
+        return;
+    }
+    if let Err(err) = watch::start(exe, &watch::lock_path()) {
+        eprintln!("rexroster: couldn't start the watcher: {err:#}");
     }
 }

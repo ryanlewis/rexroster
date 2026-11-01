@@ -1603,7 +1603,11 @@ mod tests {
         p.key(KeyCode::Char('j'), &mut opts);
         assert_eq!(p.cursor, 1);
         p.key(KeyCode::Down, &mut opts);
-        assert_eq!(p.cursor, 1, "stops at the last option");
+        p.key(KeyCode::Down, &mut opts);
+        p.key(KeyCode::Down, &mut opts);
+        assert_eq!(p.cursor, 3, "stops at the last option");
+        p.key(KeyCode::Up, &mut opts);
+        p.key(KeyCode::Up, &mut opts);
         p.key(KeyCode::Char(' '), &mut opts);
         assert_eq!(opts.view, View::Expanded);
         p.key(KeyCode::Left, &mut opts);
@@ -1632,11 +1636,13 @@ mod tests {
         a.on_terminal_event(&TermEvent::Key(KeyCode::Char('o').into()), &[]);
         assert!(a.panel.is_some());
         assert_eq!(
-            render_at(&mut a, &[], 32, 4),
+            render_at(&mut a, &[], 32, 6),
             [
                 "Options                         ",
                 "›border  none                   ",
                 " view    compact                ",
+                " watch   true                   ",
+                " notify  none                   ",
                 "⏎ change · esc save and close   ",
             ]
             .join("\n")
@@ -1681,22 +1687,22 @@ mod tests {
     fn sizes_for_the_panel_and_both_borders() {
         let n = Border::None;
         let r = Border::Rounded;
-        // The panel: heading, two options, hints; no separate footer.
-        assert_eq!(size::wanted_rows(PANEL_LINES, false, n), 4);
-        assert_eq!(size::wanted_rows(PANEL_LINES, false, r), 6);
+        // The panel: heading, four options, hints; no separate footer.
+        assert_eq!(size::wanted_rows(PANEL_LINES, false, n), 6);
+        assert_eq!(size::wanted_rows(PANEL_LINES, false, r), 8);
         let rex = Fake::default();
         let mut a = app(&rex);
         a.focused = true;
         a.panel = Some(Panel::new(a.opts));
         assert!(!a.footer_shown());
         a.note_rows(PANEL_LINES);
-        assert_eq!(a.fit.want, 4);
+        assert_eq!(a.fit.want, 6);
     }
 
     #[test]
     fn a_border_change_in_the_panel_resizes_once_and_saves() {
         let rex = Fake::default();
-        sized(&rex, 4);
+        sized(&rex, 6);
         let dir = std::env::temp_dir().join(format!("rexroster-tui-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut a = app(&rex);
@@ -1708,14 +1714,14 @@ mod tests {
         a.fit_layer();
         assert!(
             rex.params("session.resize_layer").is_empty(),
-            "4 rows fit the panel"
+            "6 rows fit the panel"
         );
         a.on_terminal_event(&TermEvent::Key(KeyCode::Enter.into()), &[]);
         assert_eq!(a.opts.border, Border::Rounded);
         a.note_rows(PANEL_LINES);
         a.fit_layer();
         assert_eq!(rex.params("session.resize_layer").len(), 1);
-        sized(&rex, 6);
+        sized(&rex, 8);
         a.note_rows(PANEL_LINES);
         assert!(!a.fit.dirty, "no second resize once it fits");
 
