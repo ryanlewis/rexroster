@@ -96,7 +96,9 @@ It watches every session on the Rex server, including ones created later. The wo
 
 `open` and `spawn` start the watcher in the background, in its own session with no terminal, so closing the shell or the roster does not stop it. Set `watch = false` in the config to turn this off.
 
-Only one watcher runs per user per Rex server. It holds a lock file in `$XDG_RUNTIME_DIR/rexroster/`, or in `rexroster-<uid>/` under the temp directory when `XDG_RUNTIME_DIR` is not set, for as long as it runs. A second watcher finds the lock taken and exits. The lock goes when the process ends, however it ends.
+Only one watcher runs per user per Rex server. It holds a lock file in `$XDG_RUNTIME_DIR/rexroster/`, or in `rexroster-<uid>/` under the temp directory when `XDG_RUNTIME_DIR` is not set, for as long as it runs. A second watcher finds the lock taken and exits. The lock goes when the process ends, however it ends. rexroster refuses a lock directory that another user owns or can open.
+
+If the config file can't be parsed, `open` and `spawn` print a warning and don't start the watcher, and `rexroster watch` stops with the error.
 
 The watcher runs until the Rex server goes away or the process is killed. It reads `notify` when it starts, so restart it after changing that option: kill the `rex do` process, and the next `open` or `spawn` starts a new one.
 

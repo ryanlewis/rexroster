@@ -259,6 +259,16 @@ pub fn load(path: Option<&Path>) -> (Options, Option<String>) {
     }
 }
 
+/// Load the options, or an error if the file can't be read or parsed. A
+/// missing file gives the defaults. For the watcher, where falling back to
+/// the defaults could turn on what the file turned off.
+pub fn load_strict(path: Option<&Path>) -> Result<Options> {
+    match load(path) {
+        (opts, None) => Ok(opts),
+        (_, Some(err)) => bail!("{err}"),
+    }
+}
+
 /// Write `keys` from `opts` into the file at `path`, keeping everything else
 /// in it. Creates the directory if needed and replaces the file atomically.
 pub fn save(path: &Path, opts: &Options, keys: &[Key]) -> Result<()> {
@@ -505,6 +515,20 @@ mod tests {
             "watch = false\nnotify = \"cases\"\n"
         );
         assert_eq!(parse(&std::fs::read_to_string(&file).unwrap()).unwrap(), o);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_strict_refuses_a_bad_file() {
+        // Review finding: `watch = false` beside a typo fell back to watch = true.
+        let dir = temp_dir("strict");
+        let file = dir.join("config.toml");
+        assert!(load_strict(Some(&file)).unwrap().watch);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "watch = false\nview = \"expandd\"\n").unwrap();
+        assert!(load_strict(Some(&file)).is_err());
+        std::fs::write(&file, "watch = false\n").unwrap();
+        assert!(!load_strict(Some(&file)).unwrap().watch);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

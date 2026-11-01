@@ -51,7 +51,11 @@ local function open_case(label, msg)
     "--body", (msg ~= nil and msg ~= "") and msg or "Blocked with no message.",
     "--worker", label, "--label", "rex-watch",
   }, { timeout = 10 })
-  if r and r.ok then return rex.json.decode(r.stdout).id end
+  if r and r.ok then
+    -- A bad reply must not stop the float from being recorded.
+    local ok, v = pcall(rex.json.decode, r.stdout)
+    if ok and type(v) == "table" then return v.id end
+  end
   rex.log("warn", "cases open failed: " .. ((r and r.stderr) or "did not run"))
 end
 

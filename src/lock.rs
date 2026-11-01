@@ -25,6 +25,7 @@ fn open(path: &Path) -> Result<File> {
             .mode(0o700)
             .create(dir)
             .with_context(|| format!("creating {}", dir.display()))?;
+        check_private(dir)?;
     }
     OpenOptions::new()
         .read(true)
@@ -33,6 +34,22 @@ fn open(path: &Path) -> Result<File> {
         .truncate(false)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))
+}
+
+/// The directory must be ours and closed to everyone else. In a shared temp
+/// directory another user could make it first and hold our locks.
+fn check_private(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(dir).with_context(|| format!("checking {}", dir.display()))?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "{} must be owned by uid {uid} with no access for others",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 impl Lock {
@@ -122,6 +139,21 @@ mod tests {
         assert!(Lock::try_acquire(&path).unwrap().is_none());
         drop(first);
         assert!(Lock::try_acquire(&path).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_lock_dir_others_can_use() {
+        // Review finding: a pre-made world-writable dir was used as is.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("open-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = Lock::try_acquire(&dir.join("w.lock")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no access for others"),
+            "{err:#}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
