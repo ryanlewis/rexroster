@@ -1,6 +1,7 @@
 //! The roster TUI: one `rex events` stream feeds the model; rows are redrawn
 //! in place (ratatui only writes the cells that changed).
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,7 +17,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
-use serde_json::json;
+use serde_json::{Value, json};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::{self, Border, Key, Options, View};
@@ -27,7 +28,7 @@ use crate::size;
 
 /// Where a shown worker floats: centred, most of the tab.
 const SHOWN_BOUNDS: [f64; 4] = [0.1, 0.08, 0.8, 0.84];
-/// Two clicks on the same row within this time are a double-click.
+/// Two clicks on the same worker within this time are a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Resizes allowed for one row count before giving up, so the layer can't bounce.
 const MAX_FITS: u8 = 4;
@@ -43,7 +44,7 @@ pub const PANEL_LINES: usize = Key::ALL.len() + 2;
 /// Expanded view: the most lines a message wraps to.
 pub const MSG_LINES: usize = 3;
 /// Expanded view: continuation lines start under the label.
-const INDENT: usize = 3;
+const INDENT: usize = 4;
 /// The label column's width follows the longest label, within these bounds.
 pub const LABEL_MIN: usize = 6;
 pub const LABEL_MAX: usize = 20;
@@ -90,13 +91,19 @@ struct App<'a> {
     line_owner: Vec<usize>,
     /// The pane's width when last drawn; the expanded view wraps to it.
     width: u16,
-    /// Several lines per worker instead of one.
-    expanded: bool,
     /// Whether the pane has focus; the key hints show only then.
     focused: bool,
-    last_click: Option<(usize, Instant)>,
+    /// The worker last clicked, and when, to spot a double-click.
+    last_click: Option<(String, Instant)>,
+    /// The last Rex or save error. It goes on the next key press, and on the
+    /// next refresh or action that works.
     error: Option<String>,
+    /// A problem loading the config file. It goes on the next key press only.
+    config_error: Option<String>,
     fit: Fit,
+    /// The `session.view` this pass fetched, so a fit in the same pass
+    /// needn't fetch it again. Dropped before the loop waits.
+    view: Option<Value>,
     /// When the spinner started; its frame is a function of the time since.
     spin_start: Instant,
     /// Display options in effect, and the file the options panel saves to.
@@ -176,6 +183,10 @@ struct Fit {
     want: u16,
     attempts: u8,
     last_resize: Option<Instant>,
+    /// Measuring failed (say no client has drawn the pane yet): retries
+    /// used so far, and when to try again.
+    retries: u32,
+    retry_at: Option<Instant>,
 }
 
 pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
@@ -194,11 +205,12 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         offset: 0,
         line_owner: Vec::new(),
         width: 0,
-        expanded: settings.opts.view == View::Expanded,
         focused: false,
         last_click: None,
-        error: settings.error,
+        error: None,
+        config_error: settings.error,
         fit: Fit::default(),
+        view: None,
         spin_start: Instant::now(),
         opts: settings.opts,
         config_path: settings.path,
@@ -210,12 +222,16 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         .refresh(app.rex, &app.session, now())
         .and_then(|()| {
             let mut terminal = ratatui::init();
+            install_panic_hook();
             let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
             spawn_input(input_tx);
             // A worker minimized before the roster started gets no view event.
-            app.hide_minimized();
+            app.sync(Needs {
+                view: true,
+                blocks: false,
+            });
             let result = app.run(&mut terminal, &rx);
-            let _ = execute!(std::io::stdout(), DisableFocusChange, DisableMouseCapture);
+            let _ = restore_input(&mut std::io::stdout());
             ratatui::restore();
             result
         });
@@ -223,6 +239,22 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     result
+}
+
+/// Turn off the mouse capture and focus reports that `run` turns on.
+fn restore_input(w: &mut impl Write) -> std::io::Result<()> {
+    execute!(w, DisableFocusChange, DisableMouseCapture)
+}
+
+/// On a panic, also turn off mouse capture and focus reports, then run the
+/// hook already set: ratatui's, which leaves raw mode and the alternate
+/// screen and then prints the panic.
+fn install_panic_hook() {
+    let next = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_input(&mut std::io::stdout());
+        next(info);
+    }));
 }
 
 impl App<'_> {
@@ -235,17 +267,18 @@ impl App<'_> {
             let lines = if self.panel.is_some() {
                 PANEL_LINES
             } else {
-                total_lines(&rows, self.width, self.expanded)
+                total_lines(&rows, self.width, self.expanded())
             };
             self.note_rows(lines);
-            if self.fit.dirty {
-                self.fit_layer();
-            }
+            self.fit_if_due();
             terminal.draw(|f| self.draw(f, &rows))?;
 
-            // Sleep until a message arrives or the tick is due, then take
-            // everything that is waiting.
-            let first = match rx.recv_timeout(tick(&rows)) {
+            // Sleep until a message arrives, the tick is due or a fit is to
+            // be retried, then take everything that is waiting.
+            let wait = self.fit.retry_at.map_or(tick(&rows), |t| {
+                tick(&rows).min(t.saturating_duration_since(Instant::now()))
+            });
+            let first = match rx.recv_timeout(wait) {
                 Ok(msg) => Some(msg),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => bail!("rex events stopped"),
@@ -262,21 +295,52 @@ impl App<'_> {
                     }
                 }
             }
-            if needs.view {
-                self.hide_minimized();
-            }
-            if needs.blocks
-                && let Err(err) = self.model.refresh(self.rex, &self.session, now())
-            {
-                self.error = Some(format!("{err:#}"));
-            }
+            self.sync(needs);
         }
+    }
+
+    fn expanded(&self) -> bool {
+        self.opts.view == View::Expanded
+    }
+
+    /// Fetch what the events need: the view, to hide minimized workers (kept
+    /// for a fit in this pass), and the blocks. Shows the first error, or
+    /// clears the last one when everything worked.
+    fn sync(&mut self, needs: Needs) {
+        if !needs.view && !needs.blocks {
+            return;
+        }
+        let mut res = Ok(());
+        if needs.view {
+            res = self
+                .rex
+                .call("session.view", json!({ "session_id": self.session }))
+                .and_then(|view| {
+                    let hidden = self.hide_minimized(&view);
+                    self.view = Some(view);
+                    hidden
+                });
+        }
+        if needs.blocks {
+            res = res.and(self.model.refresh(self.rex, &self.session, now()));
+        }
+        self.report(res);
+    }
+
+    /// Show an action's error, or clear the last one when it worked.
+    fn report<T>(&mut self, res: Result<T>) {
+        self.error = res.err().map(|err| format!("{err:#}"));
+    }
+
+    /// The error on the footer line, if any.
+    fn shown_error(&self) -> Option<&str> {
+        self.error.as_deref().or(self.config_error.as_deref())
     }
 
     /// The last line shows key hints while focused, and an error whenever
     /// there is one. The options panel has its own hints line instead.
     fn footer_shown(&self) -> bool {
-        self.panel.is_none() && (self.focused || self.error.is_some())
+        self.panel.is_none() && (self.focused || self.shown_error().is_some())
     }
 
     /// Note the rows the pane needs: the workers' lines, plus the footer while focused.
@@ -286,14 +350,28 @@ impl App<'_> {
             self.fit = Fit {
                 dirty: true,
                 want,
-                attempts: 0,
                 last_resize: self.fit.last_resize,
+                ..Fit::default()
             };
         }
     }
 
-    /// Resize the layer towards the wanted rows. Does nothing until the pane
-    /// has been drawn, and at most `MAX_FITS` times per row count.
+    /// Fit the layer if something asked for it or a retry is due. Drops this
+    /// pass's view either way, so the next pass fetches a fresh one.
+    fn fit_if_due(&mut self) {
+        if self.fit.retry_at.is_some_and(|t| t <= Instant::now()) {
+            self.fit.retry_at = None;
+            self.fit.dirty = true;
+        }
+        if self.fit.dirty {
+            self.fit_layer();
+        }
+        self.view = None;
+    }
+
+    /// Resize the layer towards the wanted rows, at most `MAX_FITS` times per
+    /// row count. Until the pane has been drawn it can't be measured, so it
+    /// tries again later, backing off, for up to `size::RETRY_TOTAL`.
     fn fit_layer(&mut self) {
         self.fit.dirty = false;
         if self.fit.attempts >= MAX_FITS {
@@ -302,9 +380,22 @@ impl App<'_> {
         let Some(me) = self.model.me.clone() else {
             return;
         };
-        let Some((layer, bounds, height)) = self.measure(&me) else {
+        let view = match self.view.take() {
+            Some(view) => Some(view),
+            None => self
+                .rex
+                .call("session.view", json!({ "session_id": self.session }))
+                .ok(),
+        };
+        let Some((layer, bounds, height)) = view.and_then(|v| self.measure(&me, &v)) else {
+            if let Some(delay) = size::retry_delay(self.fit.retries) {
+                self.fit.retries += 1;
+                self.fit.retry_at = Some(Instant::now() + delay);
+            }
             return;
         };
+        self.fit.retries = 0;
+        self.fit.retry_at = None;
         let [x, y, w, _] = bounds;
         let Some(new_h) = height else { return };
         self.fit.attempts += 1;
@@ -322,15 +413,12 @@ impl App<'_> {
         }
     }
 
-    /// The roster's layer, its bounds and, if it doesn't fit, the height it should have.
-    fn measure(&self, me: &str) -> Option<(String, [f64; 4], Option<f64>)> {
-        let view = self
-            .rex
-            .call("session.view", json!({ "session_id": self.session }))
-            .ok()?;
-        let (layer, bounds) = rex::floating_layer_of(&view, me)?;
+    /// The roster's layer in `view`, its bounds and, if it doesn't fit, the
+    /// height it should have.
+    fn measure(&self, me: &str, view: &Value) -> Option<(String, [f64; 4], Option<f64>)> {
+        let (layer, bounds) = rex::floating_layer_of(view, me)?;
         let lead = &self.model.lead;
-        let lead_h = rex::rect_height_of(&view, lead)?;
+        let lead_h = rex::rect_height_of(view, lead)?;
         let lead_rows = rex::drawn_rows(&self.rex.block_call(&self.session, lead, "size").ok()?)?;
         let rows = rex::drawn_rows(&self.rex.block_call(&self.session, me, "size").ok()?)?;
         let per_row = lead_h / f64::from(lead_rows);
@@ -349,15 +437,14 @@ impl App<'_> {
         match ev {
             TermEvent::Key(k) if k.kind == KeyEventKind::Press => {
                 self.error = None;
+                self.config_error = None;
                 let ctrl_c =
                     k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
                 if ctrl_c || (k.code == KeyCode::Char('q') && self.panel.is_none()) {
                     return true;
                 }
                 if let Some(panel) = &mut self.panel {
-                    let view = self.opts.view;
                     let action = panel.key(k.code, &mut self.opts);
-                    self.apply_view_option(view);
                     if action == PanelAction::Close {
                         self.close_panel();
                     }
@@ -374,7 +461,12 @@ impl App<'_> {
                         }
                     }
                     KeyCode::Char('l') => self.focus_lead(),
-                    KeyCode::Char('v') => self.expanded = !self.expanded,
+                    KeyCode::Char('v') => {
+                        self.opts.view = match self.opts.view {
+                            View::Compact => View::Expanded,
+                            View::Expanded => View::Compact,
+                        };
+                    }
                     KeyCode::Char('o') => self.panel = Some(Panel::new(self.opts)),
                     _ => {}
                 }
@@ -385,22 +477,23 @@ impl App<'_> {
                 let a = self.panel_area;
                 let inside = m.column >= a.x && m.column < a.right() && m.row >= a.y;
                 if inside && let Some(panel) = &mut self.panel {
-                    let view = self.opts.view;
                     panel.click(usize::from(m.row - a.y), &mut self.opts);
-                    self.apply_view_option(view);
                 }
             }
             TermEvent::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(i) = self.row_at(m.column, m.row).filter(|&i| i < rows.len()) {
-                    self.selected = Some(rows[i].block.clone());
+                    let block = rows[i].block.clone();
+                    self.selected = Some(block.clone());
+                    // By block, not row: the rows may have moved in between.
                     let double = self
                         .last_click
-                        .is_some_and(|(j, t)| j == i && t.elapsed() <= DOUBLE_CLICK);
+                        .as_ref()
+                        .is_some_and(|(b, t)| *b == block && t.elapsed() <= DOUBLE_CLICK);
                     if double {
                         self.last_click = None;
-                        self.toggle(&rows[i].block);
+                        self.toggle(&block);
                     } else {
-                        self.last_click = Some((i, Instant::now()));
+                        self.last_click = Some((block, Instant::now()));
                     }
                 }
             }
@@ -421,15 +514,6 @@ impl App<'_> {
         false
     }
 
-    /// The panel's view option is the starting view; changing it (from
-    /// `before`) also switches the current view, so the change shows when
-    /// the panel closes.
-    fn apply_view_option(&mut self, before: View) {
-        if self.opts.view != before {
-            self.expanded = self.opts.view == View::Expanded;
-        }
-    }
-
     /// Close the options panel and save what changed in it.
     fn close_panel(&mut self) {
         let Some(panel) = self.panel.take() else {
@@ -445,9 +529,7 @@ impl App<'_> {
                 "no config directory: set HOME or XDG_CONFIG_HOME"
             )),
         };
-        if let Err(err) = res {
-            self.error = Some(format!("{err:#}"));
-        }
+        self.report(res);
     }
 
     fn step(&mut self, rows: &[Row], by: isize) {
@@ -497,34 +579,22 @@ impl App<'_> {
                     )
                 })
         };
-        if let Err(err) = res {
-            self.error = Some(format!("{err:#}"));
-        }
+        self.report(res);
     }
 
     /// Treat Rex's minimize as hide: detach any of our workers whose layer
-    /// was minimized. The detach changes the view again, and that pass finds
-    /// nothing left to do.
-    fn hide_minimized(&mut self) {
-        let view = match self
-            .rex
-            .call("session.view", json!({ "session_id": self.session }))
-        {
-            Ok(view) => view,
-            Err(err) => {
-                self.error = Some(format!("{err:#}"));
-                return;
-            }
-        };
-        for block in self.model.to_detach(&view) {
-            let res = self.rex.call(
+    /// is minimized in `view`. The detach changes the view again, and that
+    /// pass finds nothing left to do. Returns the first error.
+    fn hide_minimized(&self, view: &Value) -> Result<()> {
+        let mut res = Ok(());
+        for block in self.model.to_detach(view) {
+            let detached = self.rex.call(
                 "session.detach_block",
                 json!({ "session_id": self.session, "block_id": block }),
             );
-            if let Err(err) = res {
-                self.error = Some(format!("{err:#}"));
-            }
+            res = res.and(detached.map(drop));
         }
+        res
     }
 
     fn focus_lead(&mut self) {
@@ -532,9 +602,7 @@ impl App<'_> {
             "session.focus_block",
             json!({ "session_id": self.session, "block_id": self.model.lead }),
         );
-        if let Err(err) = res {
-            self.error = Some(format!("{err:#}"));
-        }
+        self.report(res);
     }
 
     fn draw(&mut self, f: &mut ratatui::Frame, rows: &[Row]) {
@@ -573,7 +641,7 @@ impl App<'_> {
 
     /// The key hints, or the error when there is one, cut to `width`.
     fn footer_line(&self, width: usize) -> Line<'static> {
-        match &self.error {
+        match self.shown_error() {
             Some(err) => Line::styled(cut(err, width), Style::new().fg(Color::Red)),
             None => Line::styled(cut(FOOTER, width), Style::new().add_modifier(Modifier::DIM)),
         }
@@ -601,7 +669,7 @@ impl App<'_> {
             };
             lines.push(Line::styled(cut(&text, width), style));
         }
-        lines.push(match &self.error {
+        lines.push(match self.shown_error() {
             Some(err) => Line::styled(cut(err, width), Style::new().fg(Color::Red)),
             None => Line::styled(
                 cut(PANEL_HINTS, width),
@@ -639,7 +707,7 @@ impl App<'_> {
             sel,
             area.width,
             self.spin_start.elapsed(),
-            self.expanded,
+            self.expanded(),
         );
         let visible = usize::from(list.height);
         // Keep the selected worker on screen when the list is taller than the
@@ -725,8 +793,8 @@ fn pad(s: &str, width: usize) -> String {
     format!("{s}{}", " ".repeat(fill))
 }
 
-/// One row: `›` when selected, the glyph, `▸` when shown, the label, the age
-/// right-aligned, then the message filling the rest of `width`.
+/// One row: `›` when selected, the glyph, `▸` when shown, a space, the
+/// label, the age right-aligned, then the message filling the rest of `width`.
 pub fn row_line(
     r: &Row,
     selected: bool,
@@ -744,10 +812,10 @@ pub fn row_line(
     let mut spans = vec![
         Span::styled(if selected { "›" } else { " " }, strong),
         Span::styled(g, style),
-        Span::raw(if r.shown { "▸" } else { " " }),
+        Span::raw(if r.shown { "▸ " } else { "  " }),
         Span::styled(pad(&r.label, cols.label), strong),
     ];
-    let mut used = 3 + cols.label;
+    let mut used = 4 + cols.label;
     if cols.age > 0 {
         let age = r.age.map(short_age).unwrap_or_default();
         spans.push(Span::styled(format!(" {age:>w$}", w = cols.age), dim));
@@ -956,11 +1024,12 @@ mod tests {
             offset: 0,
             line_owner: Vec::new(),
             width: 0,
-            expanded: false,
             focused: false,
             last_click: None,
             error: None,
+            config_error: None,
             fit: Fit::default(),
+            view: None,
             spin_start: Instant::now(),
             opts: Options::default(),
             config_path: None,
@@ -1018,9 +1087,9 @@ mod tests {
         assert_eq!(
             render_at(&mut a, &rows, 40, 4),
             [
-                "›⠋▸alpha      1m Running tests          ",
-                " ✓ beta       5s PR raised              ",
-                " ◐ gamma-long 1h Allow git push to the… ",
+                "›⠋▸ alpha      1m Running tests         ",
+                " ✓  beta       5s PR raised             ",
+                " ◐  gamma-long 1h Allow git push to the…",
                 "                                        ",
             ]
             .join("\n")
@@ -1069,7 +1138,7 @@ mod tests {
             "hi",
         )];
         let line = render_at(&mut a, &rows, 30, 1);
-        assert_eq!(line, "›○ a-very-long-worker-… hi    ");
+        assert_eq!(line, "›○  a-very-long-worker-… hi   ");
     }
 
     #[test]
@@ -1099,7 +1168,7 @@ mod tests {
         a.selected = Some("block:a3".into());
         let screen = render_at(&mut a, &rows, 12, 2);
         assert!(
-            screen.lines().nth(1).unwrap().starts_with("›○ a3"),
+            screen.lines().nth(1).unwrap().starts_with("›○  a3"),
             "{screen}"
         );
         assert_eq!(a.offset, 1);
@@ -1416,7 +1485,7 @@ mod tests {
         let rex = Fake::default();
         let mut a = app(&rex);
         a.on_terminal_event(&TermEvent::Key(KeyCode::Char('v').into()), &[]);
-        assert!(a.expanded);
+        assert!(a.expanded());
         let rows = [
             tasked(
                 "alpha",
@@ -1426,14 +1495,14 @@ mod tests {
             tasked("beta", "PR raised", None),
         ];
         assert_eq!(
-            render_at(&mut a, &rows, 24, 6),
+            render_at(&mut a, &rows, 25, 6),
             [
-                "›◐ alpha  5s            ",
-                "   Allow git push to the",
-                "   remote branch now?   ",
-                "   fix login            ",
-                " ◐ beta   5s            ",
-                "   PR raised            ",
+                "›◐  alpha  5s            ",
+                "    Allow git push to the",
+                "    remote branch now?   ",
+                "    fix login            ",
+                " ◐  beta   5s            ",
+                "    PR raised            ",
             ]
             .join("\n")
         );
@@ -1443,7 +1512,7 @@ mod tests {
     fn clicks_on_any_line_pick_the_worker() {
         let rex = Fake::default();
         let mut a = app(&rex);
-        a.expanded = true;
+        a.opts.view = View::Expanded;
         let rows = [
             tasked("alpha", "one", Some("task a")),
             tasked("beta", "two", None),
@@ -1470,21 +1539,21 @@ mod tests {
             tasked("alpha", "short", None),
             tasked("beta", "short", None),
         ];
-        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        a.note_rows(total_lines(&rows, a.width, a.expanded()));
         a.fit_layer();
         assert!(rex.params("session.resize_layer").is_empty());
 
-        a.expanded = true;
-        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        a.opts.view = View::Expanded;
+        a.note_rows(total_lines(&rows, a.width, a.expanded()));
         a.fit_layer();
         assert_eq!(rex.params("session.resize_layer").len(), 1);
         sized(&rex, 4);
-        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        a.note_rows(total_lines(&rows, a.width, a.expanded()));
         assert!(!a.fit.dirty);
 
         // A longer message wraps to two lines: one more resize.
         rows[0].msg = "a message that needs two lines".into();
-        a.note_rows(total_lines(&rows, a.width, a.expanded));
+        a.note_rows(total_lines(&rows, a.width, a.expanded()));
         assert!(a.fit.dirty);
         a.fit_layer();
         assert_eq!(rex.params("session.resize_layer").len(), 2);
@@ -1509,7 +1578,7 @@ mod tests {
         // Review finding: a 5-line worker in a 3-line pane.
         let rex = Fake::default();
         let mut a = app(&rex);
-        a.expanded = true;
+        a.opts.view = View::Expanded;
         let rows = [
             tasked("alpha", "one", None),
             tasked("beta", &"word ".repeat(40), Some("task")),
@@ -1517,7 +1586,7 @@ mod tests {
         a.selected = Some("block:beta".into());
         let screen = render_at(&mut a, &rows, 24, 3);
         assert!(
-            screen.lines().next().unwrap().starts_with("›◐ beta"),
+            screen.lines().next().unwrap().starts_with("›◐  beta"),
             "{screen}"
         );
     }
@@ -1586,19 +1655,19 @@ mod tests {
             render_at(&mut a, &rows, 30, 3),
             [
                 "╭ workers ───────────────────╮",
-                "│›◐ alpha  5s Running tests  │",
+                "│›◐  alpha  5s Running tests │",
                 "╰⏎ show · v view · o options…╯",
             ]
             .join("\n")
         );
-        a.expanded = true;
+        a.opts.view = View::Expanded;
         assert_eq!(
             render_at(&mut a, &rows, 30, 5),
             [
                 "╭ workers ───────────────────╮",
-                "│›◐ alpha  5s                │",
-                "│   Running tests            │",
-                "│   fix login                │",
+                "│›◐  alpha  5s               │",
+                "│    Running tests           │",
+                "│    fix login               │",
                 "╰⏎ show · v view · o options…╯",
             ]
             .join("\n")
@@ -1662,7 +1731,7 @@ mod tests {
         a.on_terminal_event(&TermEvent::Key(KeyCode::Char('o').into()), &[]);
         a.on_terminal_event(&TermEvent::Key(KeyCode::Down.into()), &[]);
         a.on_terminal_event(&TermEvent::Key(KeyCode::Enter.into()), &[]);
-        assert!(a.expanded);
+        assert!(a.expanded());
         // With nowhere to save, closing reports it.
         a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
         assert!(a.error.as_deref().unwrap().contains("no config directory"));
@@ -1677,10 +1746,10 @@ mod tests {
         a.on_terminal_event(&key(KeyCode::Char('o').into()), &[]);
         a.on_terminal_event(&key(KeyCode::Down.into()), &[]);
         a.on_terminal_event(&key(KeyCode::Enter.into()), &[]);
-        assert!(a.expanded);
+        assert!(a.expanded());
         a.on_terminal_event(&key(KeyCode::Left.into()), &[]);
         assert_eq!(a.opts.view, View::Compact);
-        assert!(!a.expanded);
+        assert!(!a.expanded());
     }
 
     #[test]
@@ -1691,5 +1760,195 @@ mod tests {
         a.focused = true;
         let screen = render_at(&mut a, &[], 45, 1);
         assert_eq!(screen, FOOTER);
+    }
+
+    #[test]
+    fn an_error_clears_on_the_next_refresh_or_action_that_works() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let rows = [worker("alpha", "idle", false, Some(5), "hi")];
+        let blocks = Needs {
+            blocks: true,
+            view: false,
+        };
+        rex.fail("session.list_blocks");
+        a.sync(blocks);
+        assert!(render_at(&mut a, &rows, 40, 2).contains("boom"));
+        // A pass with nothing to fetch keeps it.
+        a.sync(Needs::default());
+        assert!(a.error.is_some());
+        rex.heal();
+        a.sync(blocks);
+        assert_eq!(a.error, None);
+        assert!(!render_at(&mut a, &rows, 40, 2).contains("boom"));
+        a.note_rows(1);
+        assert_eq!(a.fit.want, 1, "the footer row goes too");
+
+        // One failure in a pass is kept even when the rest of it works.
+        rex.fail("session.view");
+        a.sync(Needs {
+            blocks: true,
+            view: true,
+        });
+        assert!(a.error.as_deref().unwrap().contains("session.view"));
+        // A failed action shows; the same action working clears it.
+        rex.heal();
+        rex.fail("session.focus_block");
+        a.focus_lead();
+        assert!(a.error.is_some());
+        rex.heal();
+        a.focus_lead();
+        assert_eq!(a.error, None);
+
+        // A config file problem stays until a key press.
+        a.config_error = Some("bad config".into());
+        a.sync(blocks);
+        assert!(render_at(&mut a, &rows, 40, 2).contains("bad config"));
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('j').into()), &rows);
+        assert_eq!(a.shown_error(), None);
+    }
+
+    #[test]
+    fn retries_the_fit_until_the_pane_is_drawn() {
+        let rex = Fake::default();
+        sized(&rex, 1);
+        let undrawn = json!({"rows": 24, "columns": 80, "desired": []});
+        rex.on("block:roster size", undrawn.clone());
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        a.fit_if_due();
+        assert!(rex.params("session.resize_layer").is_empty());
+        assert!(a.fit.retry_at.is_some(), "a retry is scheduled");
+        // Not due yet: nothing happens.
+        a.fit_if_due();
+        assert_eq!(a.fit.retries, 1);
+
+        // A client draws the pane, and no Resize ever arrives.
+        rex.on(
+            "block:roster size",
+            json!({"rows": 1, "desired": [{"rows": 1}]}),
+        );
+        a.fit.retry_at = Some(Instant::now());
+        a.fit_if_due();
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        assert_eq!((a.fit.retries, a.fit.retry_at), (0, None));
+
+        // A pane that is never drawn: the retries stop within the budget.
+        rex.on("block:roster size", undrawn);
+        a.note_rows(5);
+        let mut fits = 0;
+        while a.fit.dirty || a.fit.retry_at.is_some() {
+            a.fit.retry_at = a.fit.retry_at.map(|_| Instant::now());
+            a.fit_if_due();
+            fits += 1;
+            assert!(fits < 100, "never stops");
+        }
+        let budget = (0..).map_while(size::retry_delay).count();
+        assert_eq!(fits, budget + 1);
+    }
+
+    #[test]
+    fn the_shown_marker_is_apart_from_the_label_at_every_width() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let rows = [
+            worker("beta-deps", "working", true, Some(5), "hi"),
+            worker("gamma", "idle", false, Some(5), "hi"),
+        ];
+        for width in 4..40 {
+            let screen = render_at(&mut a, &rows, width, 2);
+            let shown = screen.lines().next().unwrap();
+            let hidden = screen.lines().nth(1).unwrap();
+            let after = |l: &str| l.chars().nth(3);
+            assert_eq!(shown.chars().nth(2), Some('▸'), "{width}: {shown}");
+            assert_eq!(after(shown), Some(' '), "{width}: {shown}");
+            assert_eq!(after(hidden), Some(' '), "{width}: {hidden}");
+            if width > 4 {
+                // Both labels start in the same column.
+                assert_eq!(shown.find('b').map(|i| shown[..i].chars().count()), Some(4));
+                assert_eq!(
+                    hidden.find('g').map(|i| hidden[..i].chars().count()),
+                    Some(4)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v_and_the_panel_share_one_view() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let key = |c| TermEvent::Key(KeyCode::Char(c).into());
+        a.on_terminal_event(&key('v'), &[]);
+        assert_eq!(a.opts.view, View::Expanded);
+        // The panel shows the view in use, and closing it unchanged saves
+        // nothing (with nowhere to save, a save would be an error).
+        a.on_terminal_event(&key('o'), &[]);
+        assert!(render_at(&mut a, &[], 32, 4).contains("view    expanded"));
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
+        assert_eq!(a.error, None);
+        assert!(a.expanded());
+        a.on_terminal_event(&key('v'), &[]);
+        assert!(!a.expanded());
+    }
+
+    #[test]
+    fn a_view_change_fetches_the_view_once_per_pass() {
+        let rex = Fake::default();
+        sized(&rex, 1);
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        // A resize echo and a view event in the same pass.
+        a.on_terminal_event(&TermEvent::Resize(40, 1), &[]);
+        a.sync(Needs {
+            blocks: true,
+            view: true,
+        });
+        a.fit_if_due();
+        assert_eq!(rex.params("session.view").len(), 1);
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        // The view isn't kept past the pass.
+        assert!(a.view.is_none());
+        a.fit.dirty = true;
+        a.fit_if_due();
+        assert_eq!(rex.params("session.view").len(), 2);
+    }
+
+    #[test]
+    fn a_double_click_follows_the_worker_not_the_row() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let one = row("block:1", "a", "idle", false);
+        let two = row("block:2", "b", "idle", false);
+        let click = TermEvent::Mouse(ratatui::crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        let rows = [one.clone(), two.clone()];
+        render(&mut a, &rows);
+        a.on_terminal_event(&click, &rows);
+        // The rows swap places before the second click on the same line.
+        let swapped = [two, one];
+        render(&mut a, &swapped);
+        a.on_terminal_event(&click, &swapped);
+        assert!(rex.methods().is_empty(), "{:?}", rex.methods());
+        assert_eq!(a.selected.as_deref(), Some("block:1"));
+        // A second click on block:1 is the double-click.
+        a.on_terminal_event(&click, &swapped);
+        assert_eq!(rex.params("session.move_block")[0]["block_id"], "block:1");
+    }
+
+    #[test]
+    fn restoring_input_turns_off_mouse_capture_and_focus_reports() {
+        // The panic hook and the normal exit both use this.
+        let mut out = Vec::new();
+        restore_input(&mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\x1b[?1004l"), "focus reports: {out:?}");
+        assert!(out.contains("\x1b[?1000l"), "mouse capture: {out:?}");
     }
 }
