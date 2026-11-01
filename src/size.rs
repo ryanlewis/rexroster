@@ -10,12 +10,25 @@ pub const MAX_HEIGHT: f64 = 0.6;
 /// The fewest rows the layer shrinks to: one line plus about a row of window chrome.
 pub const MIN_ROWS: f64 = 2.0;
 
-/// Terminal rows wanted: the lines the workers take, plus the footer line
-/// when it shows. There is no frame. Never less than one row.
-pub fn wanted_rows(lines: usize, footer: bool) -> u16 {
+use crate::config::Border;
+
+/// Rows the border takes: none, or a top and bottom line.
+pub fn chrome_rows(border: Border) -> u16 {
+    match border {
+        Border::None => 0,
+        Border::Rounded => 2,
+    }
+}
+
+/// Terminal rows wanted for `lines` lines of content. Without a border the
+/// footer takes a line of its own; with one it sits on the bottom border.
+/// Never less than one row.
+pub fn wanted_rows(lines: usize, footer: bool, border: Border) -> u16 {
+    let footer_line = footer && border == Border::None;
     u16::try_from(lines)
         .unwrap_or(u16::MAX)
-        .saturating_add(u16::from(footer))
+        .saturating_add(u16::from(footer_line))
+        .saturating_add(chrome_rows(border))
         .max(1)
 }
 
@@ -85,11 +98,22 @@ mod tests {
 
     #[test]
     fn wanted_rows_counts_workers_and_the_footer() {
-        assert_eq!(wanted_rows(3, false), 3);
-        assert_eq!(wanted_rows(3, true), 4);
-        assert_eq!(wanted_rows(0, false), 1);
-        assert_eq!(wanted_rows(0, true), 1);
-        assert_eq!(wanted_rows(usize::MAX, true), u16::MAX);
+        let n = Border::None;
+        assert_eq!(wanted_rows(3, false, n), 3);
+        assert_eq!(wanted_rows(3, true, n), 4);
+        assert_eq!(wanted_rows(0, false, n), 1);
+        assert_eq!(wanted_rows(0, true, n), 1);
+        assert_eq!(wanted_rows(usize::MAX, true, n), u16::MAX);
+    }
+
+    #[test]
+    fn wanted_rows_with_a_border() {
+        let r = Border::Rounded;
+        // Two border rows; the footer sits on the bottom one.
+        assert_eq!(wanted_rows(3, false, r), 5);
+        assert_eq!(wanted_rows(3, true, r), 5);
+        assert_eq!(wanted_rows(0, false, r), 2);
+        assert_eq!(wanted_rows(usize::MAX, false, r), u16::MAX);
     }
 
     #[test]
@@ -97,7 +121,7 @@ mod tests {
         // Simulate a layer with one row of chrome: rows = h / PER - 1.
         #[allow(clippy::cast_possible_truncation)]
         let rows_of = |h: f64| ((h / PER).round() as u16).saturating_sub(1);
-        let want = wanted_rows(3, true);
+        let want = wanted_rows(3, true, Border::None);
         let mut h = 0.12;
         let mut resizes = 0;
         while let Some(next) = new_height(want, rows_of(h), PER, 0.02, h) {

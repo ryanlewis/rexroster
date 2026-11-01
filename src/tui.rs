@@ -1,6 +1,7 @@
 //! The roster TUI: one `rex events` stream feeds the model; rows are redrawn
 //! in place (ratatui only writes the cells that changed).
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,10 +15,11 @@ use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Paragraph};
 use serde_json::json;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::config::{self, Border, Key, Options, View};
 use crate::events::{self, Event};
 use crate::model::{Model, Needs, Row, short_age};
 use crate::rex::{self, Rex};
@@ -33,7 +35,11 @@ const MAX_FITS: u8 = 4;
 const OWN_RESIZE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Key hints, shown on the last line while the roster has focus.
-pub const FOOTER: &str = "⏎ show/hide · v view · l lead · q quit";
+pub const FOOTER: &str = "⏎ show · v view · o options · l lead · q quit";
+/// Hints on the options panel's last line.
+pub const PANEL_HINTS: &str = "⏎ change · esc save and close";
+/// Lines the options panel takes: a heading, one per option, the hints.
+pub const PANEL_LINES: usize = Key::ALL.len() + 2;
 /// Expanded view: the most lines a message wraps to.
 pub const MSG_LINES: usize = 3;
 /// Expanded view: continuation lines start under the label.
@@ -93,6 +99,75 @@ struct App<'a> {
     fit: Fit,
     /// When the spinner started; its frame is a function of the time since.
     spin_start: Instant,
+    /// Display options in effect, and the file the options panel saves to.
+    opts: Options,
+    config_path: Option<PathBuf>,
+    /// The options panel, while it is open, and where its options were drawn.
+    panel: Option<Panel>,
+    panel_area: Rect,
+}
+
+/// What `rexroster` starts the TUI with.
+pub struct Settings {
+    pub opts: Options,
+    pub path: Option<PathBuf>,
+    /// A problem loading the config file, shown on the footer line.
+    pub error: Option<String>,
+}
+
+/// The options panel: which option the cursor is on, and the options as they
+/// were when it opened, so closing saves only what changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Panel {
+    pub cursor: usize,
+    pub start: Options,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PanelAction {
+    Stay,
+    Close,
+}
+
+impl Panel {
+    pub fn new(opts: Options) -> Self {
+        Self {
+            cursor: 0,
+            start: opts,
+        }
+    }
+
+    /// Handle a key: move, cycle the option under the cursor, or close.
+    pub fn key(&mut self, code: KeyCode, opts: &mut Options) -> PanelAction {
+        let last = Key::ALL.len() - 1;
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => self.cursor = (self.cursor + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                opts.cycle(Key::ALL[self.cursor], 1);
+            }
+            KeyCode::Left => opts.cycle(Key::ALL[self.cursor], -1),
+            KeyCode::Esc | KeyCode::Char('o') => return PanelAction::Close,
+            _ => {}
+        }
+        PanelAction::Stay
+    }
+
+    /// A click on option `index` moves the cursor there and cycles it.
+    pub fn click(&mut self, index: usize, opts: &mut Options) {
+        if let Some(key) = Key::ALL.get(index) {
+            self.cursor = index;
+            opts.cycle(*key, 1);
+        }
+    }
+
+    /// The options that differ from when the panel opened.
+    pub fn changed(&self, opts: &Options) -> Vec<Key> {
+        Key::ALL
+            .into_iter()
+            .filter(|k| opts.value(*k) != self.start.value(*k))
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -103,7 +178,7 @@ struct Fit {
     last_resize: Option<Instant>,
 }
 
-pub fn run(lead: String, session: String) -> Result<()> {
+pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
     let cli = rex::Cli::new();
     let me = std::env::var("REX_BLOCK").ok().filter(|s| !s.is_empty());
     let (tx, rx) = mpsc::channel();
@@ -119,12 +194,16 @@ pub fn run(lead: String, session: String) -> Result<()> {
         offset: 0,
         line_owner: Vec::new(),
         width: 0,
-        expanded: false,
+        expanded: settings.opts.view == View::Expanded,
         focused: false,
         last_click: None,
-        error: None,
+        error: settings.error,
         fit: Fit::default(),
         spin_start: Instant::now(),
+        opts: settings.opts,
+        config_path: settings.path,
+        panel: None,
+        panel_area: Rect::default(),
     };
     let result = app
         .model
@@ -153,7 +232,12 @@ impl App<'_> {
             if self.model.should_exit(now()) {
                 return Ok(());
             }
-            self.note_rows(total_lines(&rows, self.width, self.expanded));
+            let lines = if self.panel.is_some() {
+                PANEL_LINES
+            } else {
+                total_lines(&rows, self.width, self.expanded)
+            };
+            self.note_rows(lines);
             if self.fit.dirty {
                 self.fit_layer();
             }
@@ -189,14 +273,15 @@ impl App<'_> {
         }
     }
 
-    /// The last line shows key hints while focused, and an error whenever there is one.
+    /// The last line shows key hints while focused, and an error whenever
+    /// there is one. The options panel has its own hints line instead.
     fn footer_shown(&self) -> bool {
-        self.focused || self.error.is_some()
+        self.panel.is_none() && (self.focused || self.error.is_some())
     }
 
     /// Note the rows the pane needs: the workers' lines, plus the footer while focused.
     fn note_rows(&mut self, lines: usize) {
-        let want = size::wanted_rows(lines, self.footer_shown());
+        let want = size::wanted_rows(lines, self.footer_shown(), self.opts.border);
         if want != self.fit.want {
             self.fit = Fit {
                 dirty: true,
@@ -266,6 +351,16 @@ impl App<'_> {
                 self.error = None;
                 let ctrl_c =
                     k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
+                if ctrl_c || (k.code == KeyCode::Char('q') && self.panel.is_none()) {
+                    return true;
+                }
+                if let Some(panel) = &mut self.panel {
+                    if panel.key(k.code, &mut self.opts) == PanelAction::Close {
+                        self.close_panel();
+                    }
+                    self.apply_view_option();
+                    return false;
+                }
                 match k.code {
                     KeyCode::Char('q') => return true,
                     _ if ctrl_c => return true,
@@ -278,7 +373,18 @@ impl App<'_> {
                     }
                     KeyCode::Char('l') => self.focus_lead(),
                     KeyCode::Char('v') => self.expanded = !self.expanded,
+                    KeyCode::Char('o') => self.panel = Some(Panel::new(self.opts)),
                     _ => {}
+                }
+            }
+            TermEvent::Mouse(m)
+                if m.kind == MouseEventKind::Down(MouseButton::Left) && self.panel.is_some() =>
+            {
+                let a = self.panel_area;
+                let inside = m.column >= a.x && m.column < a.right() && m.row >= a.y;
+                if inside && let Some(panel) = &mut self.panel {
+                    panel.click(usize::from(m.row - a.y), &mut self.opts);
+                    self.apply_view_option();
                 }
             }
             TermEvent::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
@@ -310,6 +416,36 @@ impl App<'_> {
             _ => {}
         }
         false
+    }
+
+    /// The panel's view option is the starting view; changing it also
+    /// switches the current view, so the change shows when the panel closes.
+    fn apply_view_option(&mut self) {
+        if let Some(panel) = &self.panel
+            && self.opts.view != panel.start.view
+        {
+            self.expanded = self.opts.view == View::Expanded;
+        }
+    }
+
+    /// Close the options panel and save what changed in it.
+    fn close_panel(&mut self) {
+        let Some(panel) = self.panel.take() else {
+            return;
+        };
+        let keys = panel.changed(&self.opts);
+        if keys.is_empty() {
+            return;
+        }
+        let res = match &self.config_path {
+            Some(path) => config::save(path, &self.opts, &keys),
+            None => Err(anyhow::anyhow!(
+                "no config directory: set HOME or XDG_CONFIG_HOME"
+            )),
+        };
+        if let Err(err) = res {
+            self.error = Some(format!("{err:#}"));
+        }
     }
 
     fn step(&mut self, rows: &[Row], by: isize) {
@@ -401,13 +537,99 @@ impl App<'_> {
 
     fn draw(&mut self, f: &mut ratatui::Frame, rows: &[Row]) {
         let area = f.area();
-        let footer = u16::from(self.footer_shown() && area.height > 0);
+        let footer = self.footer_line(usize::from(area.width.saturating_sub(2)));
+        let inner = match self.opts.border {
+            Border::None => area,
+            Border::Rounded => {
+                let title = if self.panel.is_some() {
+                    " options "
+                } else {
+                    " workers "
+                };
+                let mut block = Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(Color::DarkGray))
+                    .title(Line::styled(title, Style::new().fg(Color::Gray)));
+                if self.footer_shown() {
+                    block = block.title_bottom(footer.clone());
+                }
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                inner
+            }
+        };
+        self.width = inner.width;
+        if self.panel.is_some() {
+            self.draw_panel(f, inner);
+        } else {
+            let footer =
+                (self.opts.border == Border::None && self.footer_shown()).then_some(footer);
+            self.draw_list(f, inner, rows, footer);
+        }
+    }
+
+    /// The key hints, or the error when there is one, cut to `width`.
+    fn footer_line(&self, width: usize) -> Line<'static> {
+        match &self.error {
+            Some(err) => Line::styled(cut(err, width), Style::new().fg(Color::Red)),
+            None => Line::styled(cut(FOOTER, width), Style::new().add_modifier(Modifier::DIM)),
+        }
+    }
+
+    fn draw_panel(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        let Some(panel) = &self.panel else { return };
+        let width = usize::from(area.width);
+        let mut lines = vec![Line::styled(
+            cut("Options", width),
+            Style::new().add_modifier(Modifier::BOLD),
+        )];
+        for (i, key) in Key::ALL.into_iter().enumerate() {
+            let selected = i == panel.cursor;
+            let text = format!(
+                "{}{:<7} {}",
+                if selected { "›" } else { " " },
+                key.name(),
+                self.opts.value(key)
+            );
+            let style = if selected {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            lines.push(Line::styled(cut(&text, width), style));
+        }
+        lines.push(match &self.error {
+            Some(err) => Line::styled(cut(err, width), Style::new().fg(Color::Red)),
+            None => Line::styled(
+                cut(PANEL_HINTS, width),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        });
+        // Clicks land on the option lines, under the heading.
+        self.panel_area = Rect {
+            y: area.y.saturating_add(1),
+            height: area
+                .height
+                .saturating_sub(1)
+                .min(u16::try_from(Key::ALL.len()).unwrap_or(0)),
+            ..area
+        };
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn draw_list(
+        &mut self,
+        f: &mut ratatui::Frame,
+        area: Rect,
+        rows: &[Row],
+        footer: Option<Line>,
+    ) {
+        let footer_rows = u16::from(footer.is_some() && area.height > 0);
         let list = Rect {
-            height: area.height - footer,
+            height: area.height - footer_rows,
             ..area
         };
         self.list_area = list;
-        self.width = area.width;
         let sel = self.selected_index(rows);
         let laid = layout(
             rows,
@@ -434,12 +656,7 @@ impl App<'_> {
             .map(|(_, l)| l)
             .collect();
         f.render_widget(Paragraph::new(lines), list);
-        if footer == 1 {
-            let width = usize::from(area.width);
-            let line = match &self.error {
-                Some(err) => Line::styled(cut(err, width), Style::new().fg(Color::Red)),
-                None => Line::styled(cut(FOOTER, width), Style::new().add_modifier(Modifier::DIM)),
-            };
+        if let Some(line) = footer.filter(|_| footer_rows == 1) {
             let at = Rect {
                 y: area.bottom() - 1,
                 height: 1,
@@ -729,6 +946,10 @@ mod tests {
             error: None,
             fit: Fit::default(),
             spin_start: Instant::now(),
+            opts: Options::default(),
+            config_path: None,
+            panel: None,
+            panel_area: Rect::default(),
         }
     }
 
@@ -845,7 +1066,7 @@ mod tests {
         let screen = render_at(&mut a, &rows, 40, 2);
         assert_eq!(
             screen.lines().nth(1),
-            Some("⏎ show/hide · v view · l lead · q quit  ")
+            Some("⏎ show · v view · o options · l lead…   ")
         );
         a.on_terminal_event(&TermEvent::FocusLost, &rows);
         assert!(!render_at(&mut a, &rows, 40, 2).contains("l lead"));
@@ -1138,7 +1359,10 @@ mod tests {
         let rows = [short, long, same, none];
         assert_eq!(total_lines(&rows, 30, false), 4);
         assert_eq!(total_lines(&rows, 30, true), 3 + 5 + 2 + 1);
-        assert_eq!(size::wanted_rows(total_lines(&rows, 30, true), true), 12);
+        assert_eq!(
+            size::wanted_rows(total_lines(&rows, 30, true), true, Border::None),
+            12
+        );
     }
 
     #[test]
@@ -1250,5 +1474,151 @@ mod tests {
             screen.lines().next().unwrap().starts_with("›◐ beta"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn panel_is_a_state_machine() {
+        let mut opts = Options::default();
+        let mut p = Panel::new(opts);
+        assert_eq!(p.key(KeyCode::Enter, &mut opts), PanelAction::Stay);
+        assert_eq!(opts.border, Border::Rounded);
+        p.key(KeyCode::Char('j'), &mut opts);
+        assert_eq!(p.cursor, 1);
+        p.key(KeyCode::Down, &mut opts);
+        assert_eq!(p.cursor, 1, "stops at the last option");
+        p.key(KeyCode::Char(' '), &mut opts);
+        assert_eq!(opts.view, View::Expanded);
+        p.key(KeyCode::Left, &mut opts);
+        assert_eq!(opts.view, View::Compact);
+        // Back where it started: only the border changed.
+        assert_eq!(p.changed(&opts), [Key::Border]);
+        p.key(KeyCode::Up, &mut opts);
+        p.key(KeyCode::Right, &mut opts);
+        assert!(p.changed(&opts).is_empty());
+        p.click(1, &mut opts);
+        assert_eq!((p.cursor, opts.view), (1, View::Expanded));
+        p.click(9, &mut opts);
+        assert_eq!(
+            opts.view,
+            View::Expanded,
+            "a click past the options does nothing"
+        );
+        assert_eq!(p.key(KeyCode::Esc, &mut opts), PanelAction::Close);
+        assert_eq!(p.key(KeyCode::Char('o'), &mut opts), PanelAction::Close);
+    }
+
+    #[test]
+    fn draws_the_options_panel() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('o').into()), &[]);
+        assert!(a.panel.is_some());
+        assert_eq!(
+            render_at(&mut a, &[], 32, 4),
+            [
+                "Options                         ",
+                "›border  none                   ",
+                " view    compact                ",
+                "⏎ change · esc save and close   ",
+            ]
+            .join("\n")
+        );
+        // q doesn't quit from the panel; Esc closes it.
+        assert!(!a.on_terminal_event(&TermEvent::Key(KeyCode::Char('q').into()), &[]));
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
+        assert!(a.panel.is_none());
+    }
+
+    #[test]
+    fn draws_a_rounded_border_in_both_views() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.opts.border = Border::Rounded;
+        a.focused = true;
+        let rows = [tasked("alpha", "Running tests", Some("fix login"))];
+        assert_eq!(
+            render_at(&mut a, &rows, 30, 3),
+            [
+                "╭ workers ───────────────────╮",
+                "│›◐ alpha  5s Running tests  │",
+                "╰⏎ show · v view · o options…╯",
+            ]
+            .join("\n")
+        );
+        a.expanded = true;
+        assert_eq!(
+            render_at(&mut a, &rows, 30, 5),
+            [
+                "╭ workers ───────────────────╮",
+                "│›◐ alpha  5s                │",
+                "│   Running tests            │",
+                "│   fix login                │",
+                "╰⏎ show · v view · o options…╯",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn sizes_for_the_panel_and_both_borders() {
+        let n = Border::None;
+        let r = Border::Rounded;
+        // The panel: heading, two options, hints; no separate footer.
+        assert_eq!(size::wanted_rows(PANEL_LINES, false, n), 4);
+        assert_eq!(size::wanted_rows(PANEL_LINES, false, r), 6);
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.focused = true;
+        a.panel = Some(Panel::new(a.opts));
+        assert!(!a.footer_shown());
+        a.note_rows(PANEL_LINES);
+        assert_eq!(a.fit.want, 4);
+    }
+
+    #[test]
+    fn a_border_change_in_the_panel_resizes_once_and_saves() {
+        let rex = Fake::default();
+        sized(&rex, 4);
+        let dir = std::env::temp_dir().join(format!("rexroster-tui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.config_path = Some(dir.join("config.toml"));
+        let key = |c| TermEvent::Key(KeyCode::Char(c).into());
+        a.on_terminal_event(&key('o'), &[]);
+        a.note_rows(PANEL_LINES);
+        a.fit_layer();
+        assert!(
+            rex.params("session.resize_layer").is_empty(),
+            "4 rows fit the panel"
+        );
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Enter.into()), &[]);
+        assert_eq!(a.opts.border, Border::Rounded);
+        a.note_rows(PANEL_LINES);
+        a.fit_layer();
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        sized(&rex, 6);
+        a.note_rows(PANEL_LINES);
+        assert!(!a.fit.dirty, "no second resize once it fits");
+
+        a.on_terminal_event(&key('o'), &[]);
+        assert!(a.panel.is_none());
+        assert_eq!(a.error, None);
+        let text = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert_eq!(text, "border = \"rounded\"\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_view_option_sets_the_current_view_too() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('o').into()), &[]);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Down.into()), &[]);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Enter.into()), &[]);
+        assert!(a.expanded);
+        // With nowhere to save, closing reports it.
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Esc.into()), &[]);
+        assert!(a.error.as_deref().unwrap().contains("no config directory"));
     }
 }

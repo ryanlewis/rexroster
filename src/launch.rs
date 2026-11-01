@@ -25,7 +25,14 @@ pub fn roster_label(lead: &str) -> String {
 }
 
 /// Open the lead's roster unless one is already open. Returns the new layer's id.
-pub fn open(rex: &dyn Rex, session: &str, lead: &str, exe: &Path) -> Result<Option<String>> {
+/// `flags` are passed on to the roster's command line after `--lead <lead>`.
+pub fn open(
+    rex: &dyn Rex,
+    session: &str,
+    lead: &str,
+    exe: &Path,
+    flags: &[String],
+) -> Result<Option<String>> {
     let label = roster_label(lead);
     if rex::list_blocks(rex, session)?
         .iter()
@@ -36,7 +43,8 @@ pub fn open(rex: &dyn Rex, session: &str, lead: &str, exe: &Path) -> Result<Opti
     let view = rex.call("session.view", json!({ "session_id": session }))?;
     let window = rex::window_of(&view, lead)
         .with_context(|| format!("lead {lead} is not in a window of this session"))?;
-    let exe = utf8(exe.as_os_str())?;
+    let mut command = vec![utf8(exe.as_os_str())?, "--lead".to_owned(), lead.to_owned()];
+    command.extend(flags.iter().cloned());
     let out = rex.call(
         "session.new_layer",
         json!({
@@ -47,7 +55,7 @@ pub fn open(rex: &dyn Rex, session: &str, lead: &str, exe: &Path) -> Result<Opti
             "layout": { "block": {
                 "flavor": SHELL_FLAVOR,
                 "label": label,
-                "options": { "shell": "none", "command": [exe, "--lead", lead] },
+                "options": { "shell": "none", "command": command },
             }},
         }),
     )?;
@@ -127,7 +135,7 @@ pub fn spawn(
         .as_str()
         .context("session.new_block returned no block id")?;
     // The block exists now, so its id must reach the caller even if open fails.
-    let (layer, open_error) = match open(rex, session, spec.lead, exe) {
+    let (layer, open_error) = match open(rex, session, spec.lead, exe, &[]) {
         Ok(layer) => (layer, None),
         Err(err) => (None, Some(format!("{err:#}"))),
     };
@@ -168,7 +176,7 @@ mod tests {
         rex.on("session.list_blocks", json!({"blocks": []}));
         rex.on("session.view", view());
         rex.on("session.new_layer", json!({"layer_id": "layer:new"}));
-        let id = open(&rex, "s", LEAD, Path::new("/bin/rexroster")).unwrap();
+        let id = open(&rex, "s", LEAD, Path::new("/bin/rexroster"), &[]).unwrap();
         assert_eq!(id.as_deref(), Some("layer:new"));
         let p = &rex.params("session.new_layer")[0];
         assert_eq!(p["window_id"], "window:w");
@@ -189,7 +197,7 @@ mod tests {
             "session.list_blocks",
             json!({"blocks": [{"block_id": "block:r", "label": "roster-a1b2c3", "placement": "placed"}]}),
         );
-        assert_eq!(open(&rex, "s", LEAD, Path::new("/x")).unwrap(), None);
+        assert_eq!(open(&rex, "s", LEAD, Path::new("/x"), &[]).unwrap(), None);
         assert_eq!(rex.methods(), ["session.list_blocks"]);
     }
 
@@ -295,5 +303,18 @@ mod tests {
             json!({"block_id": "block:w", "roster_layer_id": null})
         );
         assert!(out.open_error.unwrap().contains("not in a window"));
+    }
+
+    #[test]
+    fn open_passes_display_flags_to_the_roster() {
+        let rex = Fake::default();
+        rex.on("session.list_blocks", json!({"blocks": []}));
+        rex.on("session.view", view());
+        let flags = ["--border".to_owned(), "rounded".to_owned()];
+        open(&rex, "s", LEAD, Path::new("/bin/rr"), &flags).unwrap();
+        assert_eq!(
+            rex.params("session.new_layer")[0]["layout"]["block"]["options"]["command"],
+            json!(["/bin/rr", "--lead", LEAD, "--border", "rounded"])
+        );
     }
 }
