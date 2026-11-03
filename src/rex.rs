@@ -198,6 +198,12 @@ pub fn drawn_columns(size: &Value) -> Option<u16> {
     u16::try_from(size["columns"].as_u64()?).ok()
 }
 
+/// A terminal's cell height in pixels from its `size` method: its real
+/// height spread over its rows, so less than a full cell when squeezed.
+pub fn cell_height_px(size: &Value) -> Option<u32> {
+    u32::try_from(size["cell_height_px"].as_u64()?).ok()
+}
+
 #[cfg(test)]
 pub mod fake {
     //! A [`Rex`] that answers from canned responses and records every call.

@@ -82,6 +82,21 @@ pub fn new_height(want: u16, rows: u16, per_row: f64, y: f64, h: f64) -> Option<
     ((target - h).abs() > 1e-6).then_some(target)
 }
 
+/// The rows that fit in full, from the `rows` a terminal reports.
+///
+/// Rex rounds a partial row up, so a layer squeezed below one row still
+/// reports `rows: 1`, and it would look as if it fits. Its `cell_height_px` gives
+/// it away: the terminal's real height spread over its rows, less than a
+/// full cell (`full_cell_px`, from a pane that isn't squeezed). Each row may
+/// round down by a pixel, which isn't a missing row.
+pub fn full_rows(rows: u16, cell_px: u32, full_cell_px: u32) -> u16 {
+    if cell_px == 0 || full_cell_px == 0 || cell_px >= full_cell_px {
+        return rows;
+    }
+    let px = u64::from(rows) * u64::from(cell_px + 1);
+    u16::try_from(px / u64::from(full_cell_px)).map_or(rows, |n| n.min(rows))
+}
+
 /// One row's share of the window height, learned from the layer's own
 /// resizes.
 ///
@@ -140,6 +155,20 @@ mod tests {
     use super::*;
 
     const PER: f64 = 0.02; // 50 rows in the window
+
+    #[test]
+    fn a_squeezed_row_does_not_count() {
+        // Half a row's height, reported as one row.
+        assert_eq!(full_rows(1, 15, 34), 0);
+        // A pixel short a row is rounding, not a missing row.
+        assert_eq!(full_rows(10, 33, 34), 10);
+        assert_eq!(full_rows(3, 34, 34), 3);
+        // Two rows' height over three rows: two fit.
+        assert_eq!(full_rows(3, 23, 34), 2);
+        // No cell heights reported: trust the rows.
+        assert_eq!(full_rows(4, 0, 34), 4);
+        assert_eq!(full_rows(4, 15, 0), 4);
+    }
 
     #[test]
     fn row_scale_learns_from_a_resize() {

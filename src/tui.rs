@@ -433,7 +433,14 @@ impl App<'_> {
         let lead_size = self.rex.block_call(&self.session, lead, "size").ok()?;
         let my_size = self.rex.block_call(&self.session, me, "size").ok()?;
         let lead_rows = rex::drawn_rows(&lead_size)?;
-        let rows = rex::drawn_rows(&my_size)?;
+        let mut rows = rex::drawn_rows(&my_size)?;
+        // A layer squeezed below a row still reports one; count only full rows.
+        if let (Some(mine), Some(full)) = (
+            rex::cell_height_px(&my_size),
+            rex::cell_height_px(&lead_size),
+        ) {
+            rows = size::full_rows(rows, mine, full);
+        }
         let per_row = self
             .row_scale
             .observe(bounds[3], rows, lead_h / f64::from(lead_rows));
@@ -1373,6 +1380,29 @@ mod tests {
         assert!((b[0] + b[2] - 0.99).abs() < 1e-9, "{b:?}");
         assert_eq!(b[1], 0.02);
         assert!((b[3] - 0.12).abs() < 1e-9, "{b:?}");
+    }
+
+    #[test]
+    fn grows_a_layer_squeezed_below_a_row() {
+        // Rex reports one row, but at 15px of a 34px cell it is half hidden.
+        let rex = Fake::default();
+        sized(&rex, 1);
+        rex.on(
+            "block:lead size",
+            json!({"rows": 25, "cell_height_px": 34, "desired": [{"rows": 25}]}),
+        );
+        rex.on(
+            "block:roster size",
+            json!({"rows": 1, "cell_height_px": 15, "desired": [{"rows": 1}]}),
+        );
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(1);
+        a.fit_layer();
+        let p = &rex.params("session.resize_layer")[0];
+        // A row is 0.02 of the window: one row missing.
+        let h = p["bounds"][3].as_f64().unwrap();
+        assert!((h - 0.14).abs() < 1e-9, "{h}");
     }
 
     #[test]
