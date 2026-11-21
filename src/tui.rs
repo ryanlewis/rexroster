@@ -1248,6 +1248,8 @@ mod tests {
         /// Told when a spawn reaches `new_block`, which then waits for `gate`.
         reached: std::sync::Mutex<Option<mpsc::Sender<()>>>,
         gate: std::sync::Mutex<Option<Receiver<()>>>,
+        /// The open lock, which must be held when the roster relabels itself.
+        lock: std::sync::Mutex<Option<PathBuf>>,
     }
 
     impl Server {
@@ -1294,6 +1296,12 @@ mod tests {
                     json!({"layer_id": "layer:r2"})
                 }
                 "session.set_block_label" => {
+                    if let Some(lock) = &*self.lock.lock().unwrap() {
+                        assert!(
+                            Lock::try_acquire(lock).unwrap().is_none(),
+                            "relabelled unlocked"
+                        );
+                    }
                     let id = params["block_id"].as_str().unwrap();
                     for (b, l) in self.blocks.lock().unwrap().iter_mut() {
                         if b == id {
@@ -1376,7 +1384,6 @@ mod tests {
             Some(launch::roster_label("block:lead"))
         );
         assert_eq!(*server.layers.lock().unwrap(), 0);
-        let _ = std::fs::remove_dir_all(&*dir);
     }
 
     #[test]
@@ -1387,13 +1394,17 @@ mod tests {
         let server = Server::default();
         let mut a = roster_whose_last_worker_closed(&server, &dir);
         assert!(a.confirm_exit());
+        // No spawn can slip in between deciding to exit and leaving.
+        let lock = launch::open_lock(&a.pin);
+        *server.lock.lock().unwrap() = Some(lock.clone());
+        assert!(Lock::try_acquire(&lock).unwrap().is_none());
         a.leave();
+        assert!(Lock::try_acquire(&lock).unwrap().is_some());
         assert_eq!(pin::read(&a.pin), None);
         assert_eq!(server.label_of("block:me").as_deref(), Some(LEAVING_LABEL));
         let out = spawn_worker(&server, &dir);
         assert_eq!(out.json["roster_layer_id"], "layer:r2");
         assert_eq!(pin::read(&a.pin).as_deref(), Some("lead name"));
-        let _ = std::fs::remove_dir_all(&*dir);
     }
 
     fn render(app: &mut App, rows: &[Row]) -> String {
