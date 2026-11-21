@@ -120,9 +120,20 @@ pub fn run(
         None => session_label(rex, session)?.context("the session has no label to pin")?,
     };
     // Pin first, so the roster sees our rename as the pinned label.
-    write(&path(dir, session, lead), &label)?;
-    if session_label(rex, session)?.as_deref() != Some(&label) {
-        rename(rex, session, &label)?;
+    let pin = path(dir, session, lead);
+    let before = read(&pin);
+    write(&pin, &label)?;
+    let renamed = session_label(rex, session).and_then(|current| match current {
+        Some(c) if c == label => Ok(()),
+        _ => rename(rex, session, &label),
+    });
+    if let Err(err) = renamed {
+        // The session keeps its old name, so it keeps its old pin too.
+        match before {
+            Some(b) => write(&pin, &b)?,
+            None => release(&pin),
+        }
+        return Err(err);
     }
     Ok(label)
 }
@@ -205,6 +216,21 @@ mod tests {
         assert_eq!(read(&path(&dir, "s", "L")).as_deref(), Some("worker-name"));
         // Already that label: no second rename.
         assert_eq!(rex.params("session.set_label").len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_rename_puts_the_old_pin_back() {
+        let dir = lock::temp_dir("pin-run-fail");
+        let p = path(&dir, "s", "L");
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker-name"}));
+        rex.fail("session.set_label");
+        assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
+        assert_eq!(read(&p), None);
+        write(&p, "old").unwrap();
+        assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
+        assert_eq!(read(&p).as_deref(), Some("old"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
