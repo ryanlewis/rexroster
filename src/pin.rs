@@ -213,7 +213,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         release(&p);
         assert_eq!(read(&p), None);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -231,7 +230,6 @@ mod tests {
         assert_eq!(read(&path(&dir, "s", "L")).as_deref(), Some("worker-name"));
         // Already that label: no second rename.
         assert_eq!(rex.params("session.set_label").len(), 1);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -246,6 +244,5 @@ mod tests {
         write(&p, "old").unwrap();
         assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
         assert_eq!(read(&p).as_deref(), Some("old"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

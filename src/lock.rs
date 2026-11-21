@@ -124,11 +124,38 @@ pub fn server() -> String {
     std::env::var("REX_SERVER").unwrap_or_default()
 }
 
+/// A test's own empty folder in the temp dir, removed when dropped, so a
+/// failing test cleans up too.
 #[cfg(test)]
-pub fn temp_dir(name: &str) -> PathBuf {
+pub struct TempDir(PathBuf);
+
+#[cfg(test)]
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub fn temp_dir(name: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("rexroster-lock-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    dir
+    TempDir(dir)
 }
 
 #[cfg(test)]
@@ -144,7 +171,6 @@ mod tests {
         assert!(Lock::try_acquire(&path).unwrap().is_none());
         drop(first);
         assert!(Lock::try_acquire(&path).unwrap().is_some());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -159,7 +185,6 @@ mod tests {
             format!("{err:#}").contains("no access for others"),
             "{err:#}"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -176,7 +201,6 @@ mod tests {
         let released = std::time::Instant::now();
         drop(held);
         assert!(t.join().unwrap() >= released);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -186,7 +210,6 @@ mod tests {
         lock.keep_across_exec().unwrap();
         let flags = unsafe { libc::fcntl(lock.file.as_raw_fd(), libc::F_GETFD) };
         assert_eq!(flags & libc::FD_CLOEXEC, 0);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
