@@ -823,12 +823,12 @@ pub struct Columns {
 
 impl Columns {
     /// The label column fits the longest label, between `LABEL_MIN` and
-    /// `LABEL_MAX`; the age column fits the longest age.
+    /// `LABEL_MAX`; the age column fits the longest idle time.
     pub fn for_rows(rows: &[Row]) -> Self {
         let longest = rows.iter().map(|r| r.label.width()).max().unwrap_or(0);
         let age = rows
             .iter()
-            .filter_map(|r| r.age.map(|a| short_age(a).len()))
+            .filter_map(|r| idle_age(r).map(|a| short_age(a).len()))
             .max()
             .unwrap_or(0);
         Self {
@@ -836,6 +836,12 @@ impl Columns {
             age,
         }
     }
+}
+
+/// How long a worker has sat in its state, or `None` while it is working:
+/// the roster only counts the time a worker spends not working.
+fn idle_age(r: &Row) -> Option<u64> {
+    r.age.filter(|_| r.state != "working")
 }
 
 /// `s` cut to `width` display columns, ending in `…` when anything was cut.
@@ -870,14 +876,9 @@ fn pad(s: &str, width: usize) -> String {
 }
 
 /// One row: `›` when selected, the glyph, `▸` when shown, a space, the
-/// label, the age right-aligned, then the message filling the rest of `width`.
-pub fn row_line(
-    r: &Row,
-    selected: bool,
-    cols: Columns,
-    width: u16,
-    elapsed: Duration,
-) -> Line<'static> {
+/// label, then the idle time right-aligned. No message: the expanded view
+/// puts that on the lines below.
+pub fn row_line(r: &Row, selected: bool, cols: Columns, elapsed: Duration) -> Line<'static> {
     let (g, style) = glyph(&r.state, elapsed);
     let dim = Style::new().add_modifier(Modifier::DIM);
     let strong = if selected {
@@ -891,15 +892,9 @@ pub fn row_line(
         Span::raw(if r.shown { "▸ " } else { "  " }),
         Span::styled(pad(&r.label, cols.label), strong),
     ];
-    let mut used = 4 + cols.label;
     if cols.age > 0 {
-        let age = r.age.map(short_age).unwrap_or_default();
+        let age = idle_age(r).map(short_age).unwrap_or_default();
         spans.push(Span::styled(format!(" {age:>w$}", w = cols.age), dim));
-        used += 1 + cols.age;
-    }
-    let room = usize::from(width).saturating_sub(used + 1);
-    if room > 0 && !r.msg.is_empty() {
-        spans.push(Span::raw(format!(" {}", cut(&r.msg, room))));
     }
     Line::from(spans)
 }
@@ -1006,8 +1001,8 @@ pub fn layout(
     let mut out = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         let selected = sel == Some(i);
+        out.push((i, row_line(r, selected, cols, elapsed)));
         if !expanded {
-            out.push((i, row_line(r, selected, cols, width, elapsed)));
             continue;
         }
         let bold = if selected {
@@ -1015,12 +1010,6 @@ pub fn layout(
         } else {
             Style::new()
         };
-        // Line 1: markers, label and age, with no message.
-        let header = Row {
-            msg: String::new(),
-            ..r.clone()
-        };
-        out.push((i, row_line(&header, selected, cols, width, elapsed)));
         let indent = " ".repeat(INDENT);
         let room = usize::from(width).saturating_sub(INDENT);
         for text in wrap(&r.msg, room, MSG_LINES) {
@@ -1255,13 +1244,14 @@ mod tests {
                 "Allow git push to the remote?",
             ),
         ];
-        // Rendered within the first spinner tick, so frame 0. Unfocused: no footer.
+        // Rendered within the first spinner tick, so frame 0. Unfocused: no
+        // footer. No messages, and no time for the working worker.
         assert_eq!(
             render_at(&mut a, &rows, 40, 4),
             [
-                " ⠋▸ alpha      1m Running tests         ",
-                " ✓  beta       5s PR raised             ",
-                " ◐  gamma-long 1h Allow git push to the…",
+                " ⠋▸ alpha                               ",
+                " ✓  beta       5s                       ",
+                " ◐  gamma-long 1h                       ",
                 "                                        ",
             ]
             .join("\n")
@@ -1285,6 +1275,12 @@ mod tests {
             worker("b", "idle", false, Some(700), ""),
         ];
         assert_eq!(Columns::for_rows(&aged).age, 3);
+        // A working worker's time doesn't count towards the column.
+        let busy = [
+            worker("a", "idle", false, Some(5), ""),
+            worker("b", "working", false, Some(700), ""),
+        ];
+        assert_eq!(Columns::for_rows(&busy).age, 2);
     }
 
     #[test]
@@ -1310,7 +1306,7 @@ mod tests {
             "hi",
         )];
         let line = render_at(&mut a, &rows, 30, 1);
-        assert_eq!(line, " ○  a-very-long-worker-… hi   ");
+        assert_eq!(line, " ○  a-very-long-worker-…      ");
     }
 
     #[test]
@@ -1900,7 +1896,7 @@ mod tests {
             render_at(&mut a, &rows, 30, 3),
             [
                 "╭ workers ───────────────────╮",
-                "│›◐  alpha  5s Running tests │",
+                "│›◐  alpha  5s               │",
                 "╰⏎ show · v view · o options…╯",
             ]
             .join("\n")
