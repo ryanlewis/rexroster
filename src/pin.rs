@@ -146,13 +146,14 @@ pub fn run(
             return Ok(label);
         }
         // The session keeps its old name, so it keeps its old pin too,
-        // unless someone else has written the pin since.
+        // unless a spawn or another pin has written the pin since. A write
+        // between this check and the restore can still be lost.
         if read(&pin).as_deref() == Some(&label) {
             match before {
                 Some(b) => {
                     if let Err(e) = write(&pin, &b) {
                         return Err(
-                            err.context(format!("and putting the old pin back failed: {e:#}"))
+                            err.context(format!("renaming the session failed, and putting the old pin back failed too: {e:#}"))
                         );
                     }
                 }
@@ -313,7 +314,7 @@ mod tests {
         let err = run(&rex, "s", "L", Some("mine"), &dir).unwrap_err();
         assert_eq!(err.root_cause().to_string(), "session.set_label: boom");
         assert!(
-            format!("{err:#}").contains("putting the old pin back failed"),
+            format!("{err:#}").contains("putting the old pin back failed too"),
             "{err:#}"
         );
     }
