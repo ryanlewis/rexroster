@@ -45,6 +45,7 @@ Every command except `watch` and `skill` reads the session from `$REX_SESSION` a
 | `rexroster [--lead <block-id>] [--border none\|rounded] [--view compact\|expanded]` | Runs the roster for a lead. `--lead` defaults to `$REXROSTER_LEAD`. `--border` and `--view` override the config file for this run. |
 | `rexroster open <lead-block-id> [--border …] [--view …]` | Opens the lead's roster in a floating layer at the top right of the lead's tab, without focus, unless a block labelled `roster-<last 6 characters of the lead id>` already exists. Prints the new layer id, or nothing. Exits 0 in both cases. Passes `--border` and `--view` on to the roster. Then starts the watcher, if the config's `watch` is on and no watcher is running. |
 | `rexroster spawn <lead-block-id> <name> [--task <text>] [--cwd <dir>] -- <cmd> [args...]` | Starts a detached block labelled `<name>` that runs `rexroster tag <lead> [--task <text>] -- <cmd...>`, then does what `open` does. Prints `{"block_id":"…","roster_layer_id":"…"}`, where `roster_layer_id` is `null` if the roster was already open. |
+| `rexroster pin <lead-block-id> [<label>]` | Pins the session's name for the lead's run (see [The session name](#the-session-name)). With `<label>`, pins it and renames the session to it; without, pins the current name. Prints the pinned name. |
 | `rexroster tag <lead-block-id> [--task <text>] -- <cmd> [args...]` | Marks the terminal as the lead's worker, then replaces itself with `<cmd>`. |
 | `rexroster watch` | Runs the watcher in the foreground. Exits at once, with status 0, if a watcher is already running for this user and Rex server. |
 | `rexroster skill` | Prints the guide for AI agents, from [`docs/agent.md`](docs/agent.md). |
@@ -98,6 +99,10 @@ To hide a shown worker, press `Enter` on it or minimize its pane: the roster tur
 The layer's height follows the lines the workers take, plus the hints line while focused, up to 60% of the window's height. If the roster's pane is narrower than 50 columns, the roster widens it to 50, growing to the left so it stays in the corner. It never narrows a pane you have widened. If the roster never gets a worker, it exits after 30 seconds.
 
 The spinner redraws every 100 ms while any worker is working. Otherwise the roster wakes once a second to update the times.
+
+### The session name
+
+Workers are blocks in the lead's session, so a worker that renames its session (Claude Code in Rex is told to) renames the lead's. To stop that, `spawn` pins the session's name before the worker starts, unless a pin is already held, and while the lead has live workers the roster renames the session back whenever it changes. It stops reverting after 5 renames in a minute and says so on its footer line, so it never fights someone for long. The pin goes when the roster exits because its workers are gone, so a later rename sticks. To rename the session on purpose mid-run, use `rexroster pin <lead> <label>`, or rename it and then run `rexroster pin <lead>` to keep the new name. The pin is a file next to the lock files. If the roster is closed, nothing reverts.
 
 rexroster has no key binding of its own. To move focus between a lead and its roster from the keyboard, add a [custom action](https://www.superlogical.com/rex/docs/customize/actions) to Rex's `init.lua` that finds the block labelled `roster-<last 6 characters of the lead id>` in the active window and focuses it with `rex.session.focus_block`, bind it with `rex.bind`, then run `rex config reload`.
 

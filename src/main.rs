@@ -4,6 +4,7 @@ mod events;
 mod launch;
 mod lock;
 mod model;
+mod pin;
 mod rex;
 mod size;
 mod tag;
@@ -53,7 +54,19 @@ fn run(cli: Cli) -> Result<()> {
             let path = config::path();
             let (file, error) = config::load(path.as_deref());
             let opts = file.with_flags(display.border, display.view);
-            tui::run(lead, session, tui::Settings { opts, path, error })
+            let pin = cli
+                .pin_file
+                .unwrap_or_else(|| pin::path(&lock::dir(), &session, &lead));
+            tui::run(
+                lead,
+                session,
+                tui::Settings {
+                    opts,
+                    path,
+                    error,
+                    pin,
+                },
+            )
         }
         Some(Command::Open { lead, .. }) => {
             let exe = std::env::current_exe().context("finding rexroster's own path")?;
@@ -97,6 +110,11 @@ fn run(cli: Cli) -> Result<()> {
                 &lock::dir(),
             )?;
             println!("{}", out.json);
+            if let Some(err) = out.pin_error {
+                eprintln!(
+                    "rexroster: the worker started, but the session name isn't pinned: {err}"
+                );
+            }
             if let Some(err) = out.open_error {
                 eprintln!("rexroster: the worker started, but the roster didn't open: {err}");
             }
@@ -104,6 +122,17 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Tag { lead, task, cmd }) => tag::run(&lead, task.as_deref(), &cmd),
+        Some(Command::Pin { lead, label }) => {
+            let pinned = pin::run(
+                &rex::Cli::new(),
+                &session,
+                &lead,
+                label.as_deref(),
+                &lock::dir(),
+            )?;
+            println!("{pinned}");
+            Ok(())
+        }
         Some(Command::Watch | Command::Skill) => unreachable!("handled above"),
     }
 }

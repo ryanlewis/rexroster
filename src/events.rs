@@ -33,6 +33,8 @@ pub enum Event {
     },
     /// Windows, layers or placement changed.
     ViewChanged,
+    /// The session was renamed. The event doesn't say by whom.
+    SessionLabel(String),
 }
 
 impl Event {
@@ -44,7 +46,7 @@ impl Event {
             | Event::BlockChanged(b)
             | Event::Status { block: b, .. }
             | Event::StatusRemoved { block: b, .. } => Some(b),
-            Event::ViewChanged => None,
+            Event::ViewChanged | Event::SessionLabel(_) => None,
         }
     }
 }
@@ -62,6 +64,7 @@ pub fn parse(line: &str) -> Option<Event> {
         "block_created" => Some(Event::BlockCreated(block()?)),
         "block_closed" => Some(Event::BlockClosed(block()?)),
         "session_view_changed" => Some(Event::ViewChanged),
+        "session_label_changed" => Some(Event::SessionLabel(payload["label"].as_str()?.to_owned())),
         "block_event" => block_event(block()?, payload),
         t if t.starts_with("block_label") => Some(Event::BlockChanged(block()?)),
         _ => None,
@@ -152,6 +155,7 @@ mod tests {
             assert!(root_states.contains(&state), "{state} in {root_states:?}");
         }
         assert!(events.contains(&Event::ViewChanged));
+        assert!(events.contains(&Event::SessionLabel("worker-renamed-me".into())));
     }
 
     #[test]

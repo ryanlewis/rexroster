@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::lock::{self, Lock};
+use crate::pin;
 use crate::rex::{self, Rex, SHELL_FLAVOR};
 
 /// Where the roster opens: top right of the lead's tab.
@@ -34,8 +35,11 @@ pub fn open_lock(dir: &Path, session: &str, lead: &str) -> std::path::PathBuf {
 }
 
 /// Open the lead's roster unless one is already open. Returns the new layer's id.
-/// `flags` are passed on to the roster's command line after `--lead <lead>`.
-/// A lock in `lock_dir` keeps two opens at once from both creating a roster.
+/// `flags` are passed on to the roster's command line after `--lead <lead>`
+/// and `--pin-file <path>`. A lock in `lock_dir` keeps two opens at once from
+/// both creating a roster. The pin file's path goes on the command line
+/// because the roster runs in the Rex server's environment, whose temp
+/// directory may not be ours.
 pub fn open(
     rex: &dyn Rex,
     session: &str,
@@ -55,7 +59,14 @@ pub fn open(
     let view = rex.call("session.view", json!({ "session_id": session }))?;
     let window = rex::window_of(&view, lead)
         .with_context(|| format!("lead {lead} is not in a window of this session"))?;
-    let mut command = vec![utf8(exe.as_os_str())?, "--lead".to_owned(), lead.to_owned()];
+    let pin = pin::path(lock_dir, session, lead);
+    let mut command = vec![
+        utf8(exe.as_os_str())?,
+        "--lead".to_owned(),
+        lead.to_owned(),
+        "--pin-file".to_owned(),
+        utf8(pin.as_os_str())?,
+    ];
     command.extend(flags.iter().cloned());
     let out = rex.call(
         "session.new_layer",
@@ -105,6 +116,27 @@ pub struct Spawned {
     pub json: Value,
     /// Why the roster couldn't be opened. The worker is running regardless.
     pub open_error: Option<String>,
+    /// Why the session's label couldn't be pinned.
+    pub pin_error: Option<String>,
+}
+
+/// Pin the session's label for the lead, unless a pin is already held: a pin
+/// file and a roster to keep it. A pin with no roster is left from an earlier
+/// run, so it is replaced. This runs before the worker starts, so the label
+/// is still the lead's.
+pub fn pin_label(rex: &dyn Rex, session: &str, lead: &str, lock_dir: &Path) -> Result<()> {
+    let path = pin::path(lock_dir, session, lead);
+    let label = roster_label(lead);
+    let roster = rex::list_blocks(rex, session)?
+        .iter()
+        .any(|b| b.label == label);
+    if roster && pin::read(&path).is_some() {
+        return Ok(());
+    }
+    match pin::session_label(rex, session)? {
+        Some(current) => pin::write(&path, &current),
+        None => Ok(()),
+    }
 }
 
 /// Start a detached worker block, then open the roster.
@@ -116,6 +148,9 @@ pub fn spawn(
     path: Option<&OsString>,
     lock_dir: &Path,
 ) -> Result<Spawned> {
+    let pin_error = pin_label(rex, session, spec.lead, lock_dir)
+        .err()
+        .map(|err| format!("{err:#}"));
     let mut options = json!({
         // No shell: it would print a prompt, and Rex drops idle records at a
         // new prompt, which would lose the meta record.
@@ -155,6 +190,7 @@ pub fn spawn(
     Ok(Spawned {
         json: json!({ "block_id": block, "roster_layer_id": layer }),
         open_error,
+        pin_error,
     })
 }
 
@@ -195,6 +231,10 @@ mod tests {
         )
     }
 
+    fn pin_arg(dir: &Path) -> String {
+        pin::path(dir, "s", LEAD).to_str().unwrap().to_owned()
+    }
+
     fn view() -> Value {
         json!({"windows": [{"window_id": "window:w", "layers": [
             {"layer_id": "layer:t", "kind": "tiled", "blocks": [{"block_id": LEAD}]}
@@ -209,11 +249,12 @@ mod tests {
 
     #[test]
     fn open_creates_the_layer_top_right_without_focus() {
+        let dir = locks();
         let rex = Fake::default();
         rex.on("session.list_blocks", json!({"blocks": []}));
         rex.on("session.view", view());
         rex.on("session.new_layer", json!({"layer_id": "layer:new"}));
-        let id = open(&rex, "s", LEAD, Path::new("/bin/rexroster"), &[], &locks()).unwrap();
+        let id = open(&rex, "s", LEAD, Path::new("/bin/rexroster"), &[], &dir).unwrap();
         assert_eq!(id.as_deref(), Some("layer:new"));
         let p = &rex.params("session.new_layer")[0];
         assert_eq!(p["window_id"], "window:w");
@@ -223,7 +264,13 @@ mod tests {
         assert_eq!(block["label"], "roster-a1b2c3");
         assert_eq!(
             block["options"]["command"],
-            json!(["/bin/rexroster", "--lead", LEAD])
+            json!([
+                "/bin/rexroster",
+                "--lead",
+                LEAD,
+                "--pin-file",
+                pin_arg(&dir)
+            ])
         );
     }
 
@@ -354,15 +401,91 @@ mod tests {
 
     #[test]
     fn open_passes_display_flags_to_the_roster() {
+        let dir = locks();
         let rex = Fake::default();
         rex.on("session.list_blocks", json!({"blocks": []}));
         rex.on("session.view", view());
         let flags = ["--border".to_owned(), "rounded".to_owned()];
-        open(&rex, "s", LEAD, Path::new("/bin/rr"), &flags, &locks()).unwrap();
+        open(&rex, "s", LEAD, Path::new("/bin/rr"), &flags, &dir).unwrap();
         assert_eq!(
             rex.params("session.new_layer")[0]["layout"]["block"]["options"]["command"],
-            json!(["/bin/rr", "--lead", LEAD, "--border", "rounded"])
+            json!([
+                "/bin/rr",
+                "--lead",
+                LEAD,
+                "--pin-file",
+                pin_arg(&dir),
+                "--border",
+                "rounded"
+            ])
         );
+    }
+
+    #[test]
+    fn spawn_pins_the_label_before_the_worker_starts() {
+        let rex = Fake::default();
+        rex.on("session.list_blocks", json!({"blocks": []}));
+        rex.on(
+            "session.view",
+            json!({"label": "lead name", "windows": view()["windows"]}),
+        );
+        rex.on("session.new_block", json!({"block_id": "block:w"}));
+        let dir = locks();
+        let spec = Spawn {
+            lead: LEAD,
+            name: "w",
+            task: None,
+            cwd: None,
+            cmd: &["true".into()],
+        };
+        let out = spawn(&rex, "s", &spec, Path::new("/bin/rr"), None, &dir).unwrap();
+        assert!(out.pin_error.is_none());
+        let pin = pin::path(&dir, "s", LEAD);
+        assert_eq!(pin::read(&pin).as_deref(), Some("lead name"));
+        let methods = rex.methods();
+        let viewed = methods.iter().position(|m| m == "session.view").unwrap();
+        let created = methods
+            .iter()
+            .position(|m| m == "session.new_block")
+            .unwrap();
+        assert!(viewed < created, "{methods:?}");
+    }
+
+    #[test]
+    fn a_held_pin_is_kept_and_a_stale_one_replaced() {
+        let dir = locks();
+        let pin = pin::path(&dir, "s", LEAD);
+        pin::write(&pin, "first").unwrap();
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker took it"}));
+        // A roster is open: the pin is held, so a later spawn keeps it.
+        rex.on(
+            "session.list_blocks",
+            json!({"blocks": [{"block_id": "block:r", "label": "roster-a1b2c3"}]}),
+        );
+        pin_label(&rex, "s", LEAD, &dir).unwrap();
+        assert_eq!(pin::read(&pin).as_deref(), Some("first"));
+        // No roster: the pin is left over, so the current label replaces it.
+        rex.on("session.list_blocks", json!({"blocks": []}));
+        pin_label(&rex, "s", LEAD, &dir).unwrap();
+        assert_eq!(pin::read(&pin).as_deref(), Some("worker took it"));
+    }
+
+    #[test]
+    fn spawn_still_starts_the_worker_when_pinning_fails() {
+        let rex = Fake::default();
+        rex.fail("session.list_blocks");
+        rex.on("session.new_block", json!({"block_id": "block:w"}));
+        let spec = Spawn {
+            lead: LEAD,
+            name: "w",
+            task: None,
+            cwd: None,
+            cmd: &["true".into()],
+        };
+        let out = spawn(&rex, "s", &spec, Path::new("/bin/rr"), None, &locks()).unwrap();
+        assert_eq!(out.json["block_id"], "block:w");
+        assert!(out.pin_error.unwrap().contains("boom"));
     }
 
     /// A server whose blocks are shared state, slow to list, so two opens

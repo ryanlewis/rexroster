@@ -51,6 +51,11 @@ pub struct Cli {
     #[arg(long, env = "REXROSTER_LEAD")]
     pub lead: Option<String>,
 
+    /// The lead's pin file, from `open`. Defaults to the one in this
+    /// process's lock directory.
+    #[arg(long, hide = true)]
+    pub pin_file: Option<PathBuf>,
+
     #[command(flatten)]
     pub display: Display,
 
@@ -112,6 +117,15 @@ pub enum Command {
         /// The command to run, after `--`.
         #[arg(last = true, required = true)]
         cmd: Vec<OsString>,
+    },
+    /// Pin the session's name for a lead's run, so the roster puts it back
+    /// when a worker renames the session. With a label, also rename the
+    /// session to it; without one, pin the current name. Prints the pin.
+    Pin {
+        /// The lead's block id.
+        lead: String,
+        /// The name to pin.
+        label: Option<String>,
     },
     /// Print a guide for AI agents: how a lead agent uses rexroster to run
     /// worker sessions. Needs no Rex session.
