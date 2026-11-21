@@ -22,6 +22,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::{self, Border, Key, Options, View};
 use crate::events::{self, Event};
+use crate::launch;
+use crate::lock::Lock;
 use crate::model::{Model, Needs, Row, short_age};
 use crate::pin::{self, Decision};
 use crate::rex::{self, Rex};
@@ -53,6 +55,9 @@ const INDENT: usize = 4;
 /// The label column's width follows the longest label, within these bounds.
 pub const LABEL_MIN: usize = 6;
 pub const LABEL_MAX: usize = 20;
+/// The roster's block label once it is leaving, so `open` and `spawn` no
+/// longer take it for a live roster while its block closes.
+const LEAVING_LABEL: &str = "roster (closing)";
 
 /// What wakes the loop: an event from Rex (`None` when the stream ends) or
 /// terminal input. Both arrive on one channel, so either wakes it at once.
@@ -125,6 +130,8 @@ struct App<'a> {
     /// The lead's pinned session label, and the guard that decides reverts.
     pin: PathBuf,
     guard: pin::Guard,
+    /// The open lock, held from deciding to exit until the roster has left.
+    leaving: Option<Lock>,
 }
 
 /// What `rexroster` starts the TUI with.
@@ -235,6 +242,7 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         panel_area: Rect::default(),
         pin: settings.pin,
         guard: pin::Guard::default(),
+        leaving: None,
     };
     let result = app
         .model
@@ -251,8 +259,8 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
             });
             let result = app.run(&mut terminal, &rx);
             // Nothing reverts once the roster is gone, and the next spawn
-            // pins afresh, so drop the pin however the roster ends.
-            pin::release(&app.pin);
+            // pins afresh, so leave (and drop the pin) however the roster ends.
+            app.leave();
             let _ = restore_input(&mut std::io::stdout());
             ratatui::restore();
             result
@@ -283,7 +291,7 @@ impl App<'_> {
     fn run(&mut self, terminal: &mut DefaultTerminal, rx: &Receiver<Msg>) -> Result<()> {
         loop {
             let rows = self.model.rows(now());
-            if self.model.should_exit(now()) {
+            if self.model.should_exit(now()) && self.confirm_exit() {
                 return Ok(());
             }
             let lines = if self.panel.is_some() {
@@ -320,6 +328,38 @@ impl App<'_> {
             }
             self.sync(needs);
         }
+    }
+
+    /// Check again under the open lock, against a fresh listing, that the
+    /// roster is done: a worker spawned since the last event keeps it. When
+    /// it is, the lock stays held until [`App::leave`], so no spawn runs in
+    /// between. Without the lock it exits anyway, as it would have before.
+    fn confirm_exit(&mut self) -> bool {
+        let lock = Lock::acquire(&launch::open_lock(&self.pin));
+        let res = self.model.refresh(self.rex, &self.session, now());
+        let exit = res.is_ok() && self.model.should_exit(now());
+        self.report(res);
+        if exit {
+            self.leaving = lock.ok();
+        }
+        exit
+    }
+
+    /// Leave for good, under the open lock: give up the roster's label, so a
+    /// spawn after this finds no roster, pins afresh and opens a new one,
+    /// then drop the pin.
+    fn leave(&mut self) {
+        let _lock = self
+            .leaving
+            .take()
+            .or_else(|| Lock::acquire(&launch::open_lock(&self.pin)).ok());
+        if let Some(me) = &self.model.me {
+            let _ = self.rex.call(
+                "session.set_block_label",
+                json!({ "session_id": self.session, "block_id": me, "label": LEAVING_LABEL }),
+            );
+        }
+        pin::release(&self.pin);
     }
 
     /// Put the pinned label back if a worker renamed the session.
@@ -1066,6 +1106,7 @@ mod tests {
     use crate::rex::fake::Fake;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::path::Path;
 
     fn row(block: &str, label: &str, state: &str, shown: bool) -> Row {
         Row {
@@ -1079,7 +1120,7 @@ mod tests {
         }
     }
 
-    fn app(rex: &Fake) -> App<'_> {
+    fn app(rex: &dyn Rex) -> App<'_> {
         App {
             rex,
             session: "s".into(),
@@ -1104,6 +1145,7 @@ mod tests {
             panel_area: Rect::default(),
             pin: crate::lock::temp_dir("tui-pin").join("pin"),
             guard: pin::Guard::default(),
+            leaving: None,
         }
     }
 
@@ -1194,6 +1236,164 @@ mod tests {
         rex.heal();
         a.on_label("worker");
         assert_eq!(rex.params("session.set_label").len(), pin::MAX_REVERTS + 1);
+    }
+
+    /// A server whose blocks and session label are shared state, so a
+    /// roster and a spawn can run against it at once. `session.new_block`
+    /// can be held at a gate, to stop a spawn part way.
+    #[derive(Default)]
+    struct Server {
+        blocks: std::sync::Mutex<Vec<(String, String)>>,
+        layers: std::sync::Mutex<usize>,
+        /// Told when a spawn reaches `new_block`, which then waits for `gate`.
+        reached: std::sync::Mutex<Option<mpsc::Sender<()>>>,
+        gate: std::sync::Mutex<Option<Receiver<()>>>,
+    }
+
+    impl Server {
+        fn label_of(&self, id: &str) -> Option<String> {
+            let blocks = self.blocks.lock().unwrap();
+            blocks.iter().find(|(b, _)| b == id).map(|(_, l)| l.clone())
+        }
+    }
+
+    impl Rex for Server {
+        fn call(&self, method: &str, params: Value) -> Result<Value> {
+            Ok(match method {
+                "session.list_blocks" => {
+                    let blocks = self.blocks.lock().unwrap();
+                    let list: Vec<Value> = blocks
+                        .iter()
+                        .map(|(id, l)| json!({"block_id": id, "label": l, "placement": "detached"}))
+                        .collect();
+                    json!({ "blocks": list })
+                }
+                "session.view" => json!({"label": "lead name", "windows": [
+                    {"window_id": "window:w", "layers": [
+                        {"layer_id": "layer:t", "kind": "tiled", "blocks": [{"block_id": "block:lead"}]}
+                    ]}
+                ]}),
+                "session.new_block" => {
+                    if let Some(tx) = self.reached.lock().unwrap().take() {
+                        tx.send(()).unwrap();
+                    }
+                    if let Some(rx) = self.gate.lock().unwrap().take() {
+                        rx.recv().unwrap();
+                    }
+                    let label = params["label"].as_str().unwrap().to_owned();
+                    self.blocks.lock().unwrap().push(("block:w2".into(), label));
+                    json!({"block_id": "block:w2"})
+                }
+                "session.new_layer" => {
+                    *self.layers.lock().unwrap() += 1;
+                    let label = params["layout"]["block"]["label"].as_str().unwrap();
+                    self.blocks
+                        .lock()
+                        .unwrap()
+                        .push(("block:r2".into(), label.into()));
+                    json!({"layer_id": "layer:r2"})
+                }
+                "session.set_block_label" => {
+                    let id = params["block_id"].as_str().unwrap();
+                    for (b, l) in self.blocks.lock().unwrap().iter_mut() {
+                        if b == id {
+                            *l = params["label"].as_str().unwrap().to_owned();
+                        }
+                    }
+                    Value::Null
+                }
+                other => panic!("unexpected {other}"),
+            })
+        }
+
+        fn block_call(&self, _: &str, _: &str, _: &str) -> Result<Value> {
+            Ok(json!({"records": []}))
+        }
+    }
+
+    /// A roster whose only worker has just closed, with the lead's name
+    /// pinned: it has decided to exit.
+    fn roster_whose_last_worker_closed<'a>(server: &'a Server, dir: &Path) -> App<'a> {
+        server
+            .blocks
+            .lock()
+            .unwrap()
+            .push(("block:me".into(), launch::roster_label("block:lead")));
+        let mut a = app(server);
+        a.pin = pin::path(dir, "s", "block:lead");
+        pin::write(&a.pin, "lead name").unwrap();
+        a.model.refresh(server, "s", now()).unwrap();
+        live_worker(&mut a);
+        a.model.apply(Event::BlockClosed("block:w".into()), now());
+        assert!(a.model.should_exit(now()));
+        a
+    }
+
+    fn spawn_worker(server: &Server, dir: &Path) -> launch::Spawned {
+        let spec = launch::Spawn {
+            lead: "block:lead",
+            name: "w2",
+            task: None,
+            cwd: None,
+            cmd: &["true".into()],
+        };
+        launch::spawn(server, "s", &spec, Path::new("/bin/rr"), None, dir).unwrap()
+    }
+
+    #[test]
+    fn a_worker_spawned_as_the_roster_decides_to_exit_keeps_it() {
+        // The spawn has seen the roster and its pin, so it won't pin or open
+        // one, and is about to start the worker when the roster decides its
+        // last worker is gone. No `block_created` event reaches the roster.
+        let dir = crate::lock::temp_dir("tui-exit-race");
+        let server = Server::default();
+        let mut a = roster_whose_last_worker_closed(&server, &dir);
+        let (reached, at_new_block) = mpsc::channel();
+        let (open_gate, gate) = mpsc::channel();
+        *server.reached.lock().unwrap() = Some(reached);
+        *server.gate.lock().unwrap() = Some(gate);
+        let exit = std::thread::scope(|s| {
+            let spawned = s.spawn(|| spawn_worker(&server, &dir));
+            at_new_block.recv().unwrap();
+            s.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                open_gate.send(()).unwrap();
+            });
+            let exit = a.confirm_exit();
+            if exit {
+                a.leave();
+            }
+            let out = spawned.join().unwrap();
+            assert!(out.pin_error.is_none() && out.open_error.is_none());
+            exit
+        });
+        // The roster waited for the spawn, saw the new block and stayed,
+        // keeping the pin and its label for the worker.
+        assert!(!exit);
+        assert_eq!(pin::read(&a.pin).as_deref(), Some("lead name"));
+        assert_eq!(
+            server.label_of("block:me"),
+            Some(launch::roster_label("block:lead"))
+        );
+        assert_eq!(*server.layers.lock().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&*dir);
+    }
+
+    #[test]
+    fn a_worker_spawned_just_after_the_roster_leaves_gets_a_new_one_and_a_pin() {
+        // The roster's block is still listed while it closes, but under its
+        // old label it would pass for a live roster.
+        let dir = crate::lock::temp_dir("tui-exit-race-after");
+        let server = Server::default();
+        let mut a = roster_whose_last_worker_closed(&server, &dir);
+        assert!(a.confirm_exit());
+        a.leave();
+        assert_eq!(pin::read(&a.pin), None);
+        assert_eq!(server.label_of("block:me").as_deref(), Some(LEAVING_LABEL));
+        let out = spawn_worker(&server, &dir);
+        assert_eq!(out.json["roster_layer_id"], "layer:r2");
+        assert_eq!(pin::read(&a.pin).as_deref(), Some("lead name"));
+        let _ = std::fs::remove_dir_all(&*dir);
     }
 
     fn render(app: &mut App, rows: &[Row]) -> String {
