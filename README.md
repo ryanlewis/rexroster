@@ -50,7 +50,7 @@ Every command except `watch` and `skill` reads the session from `$REX_SESSION` a
 | `rexroster watch` | Runs the watcher in the foreground. Exits at once, with status 0, if a watcher is already running for this user and Rex server. |
 | `rexroster skill` | Prints the guide for AI agents, from [`docs/agent.md`](docs/agent.md). |
 
-Two `open` or `spawn` calls at the same time make only one roster: each holds a lock file while it checks for the roster and creates it.
+Two `open` or `spawn` calls at the same time make only one roster: each holds a lock file while it checks for the roster and creates it. `spawn` holds it from pinning until the roster is open, and the roster holds it while it decides to exit and leaves, so a worker spawned as the last one closes either keeps the roster or gets a new one. A leaving roster relabels its block `roster (closing)` until the block is gone.
 
 ### Running the worker's command
 

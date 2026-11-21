@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::lock::{self, Lock};
+use crate::lock::Lock;
 use crate::pin;
 use crate::rex::{self, Rex, SHELL_FLAVOR};
 
@@ -26,12 +26,13 @@ pub fn roster_label(lead: &str) -> String {
     format!("roster-{tail}")
 }
 
-/// The lock that `open` holds while it checks for the roster and creates it.
-pub fn open_lock(dir: &Path, session: &str, lead: &str) -> std::path::PathBuf {
-    dir.join(format!(
-        "open-{}.lock",
-        lock::key(&[&lock::server(), session, &roster_label(lead)])
-    ))
+/// The lock that `open` holds while it checks for the roster and creates
+/// it, `spawn` while it pins and starts a worker, and the roster while it
+/// decides to exit and leaves. It sits next to the pin file and is named
+/// after it, because the roster is handed the pin file's path and runs in an
+/// environment that may name a different lock directory or server.
+pub fn open_lock(pin: &Path) -> std::path::PathBuf {
+    pin.with_extension("lock")
 }
 
 /// Open the lead's roster unless one is already open. Returns the new layer's id.
@@ -48,7 +49,19 @@ pub fn open(
     flags: &[String],
     lock_dir: &Path,
 ) -> Result<Option<String>> {
-    let _lock = Lock::acquire(&open_lock(lock_dir, session, lead))?;
+    let _lock = Lock::acquire(&open_lock(&pin::path(lock_dir, session, lead)))?;
+    open_locked(rex, session, lead, exe, flags, lock_dir)
+}
+
+/// [`open`], with the open lock already held.
+fn open_locked(
+    rex: &dyn Rex,
+    session: &str,
+    lead: &str,
+    exe: &Path,
+    flags: &[String],
+    lock_dir: &Path,
+) -> Result<Option<String>> {
     let label = roster_label(lead);
     if rex::list_blocks(rex, session)?
         .iter()
@@ -139,7 +152,10 @@ pub fn pin_label(rex: &dyn Rex, session: &str, lead: &str, lock_dir: &Path) -> R
     }
 }
 
-/// Start a detached worker block, then open the roster.
+/// Start a detached worker block, then open the roster. The open lock is
+/// held throughout, so a roster deciding to exit either sees the new worker
+/// and stays, or has left (dropped its label and the pin) before the pin
+/// check, and this spawn pins afresh and opens a new roster.
 pub fn spawn(
     rex: &dyn Rex,
     session: &str,
@@ -148,6 +164,9 @@ pub fn spawn(
     path: Option<&OsString>,
     lock_dir: &Path,
 ) -> Result<Spawned> {
+    // Without the lock (say the lock directory is unusable) the worker still
+    // starts, and pinning and `open` report what is wrong.
+    let held = Lock::acquire(&open_lock(&pin::path(lock_dir, session, spec.lead))).ok();
     let pin_error = pin_label(rex, session, spec.lead, lock_dir)
         .err()
         .map(|err| format!("{err:#}"));
@@ -183,7 +202,12 @@ pub fn spawn(
         .as_str()
         .context("session.new_block returned no block id")?;
     // The block exists now, so its id must reach the caller even if open fails.
-    let (layer, open_error) = match open(rex, session, spec.lead, exe, &[], lock_dir) {
+    let opened = if held.is_some() {
+        open_locked(rex, session, spec.lead, exe, &[], lock_dir)
+    } else {
+        open(rex, session, spec.lead, exe, &[], lock_dir)
+    };
+    let (layer, open_error) = match opened {
         Ok(layer) => (layer, None),
         Err(err) => (None, Some(format!("{err:#}"))),
     };

@@ -190,6 +190,9 @@ pub struct Model {
     blocks: BTreeMap<String, Block>,
     started: u64,
     had_workers: bool,
+    /// Whether a refresh has listed the blocks yet. Blocks a later listing
+    /// is first to find count as created then.
+    listed: bool,
 }
 
 impl Model {
@@ -200,6 +203,7 @@ impl Model {
             blocks: BTreeMap::new(),
             started: now,
             had_workers: false,
+            listed: false,
         }
     }
 
@@ -262,7 +266,14 @@ impl Model {
             if self.ignored(&info.id) {
                 continue;
             }
+            let known = self.blocks.contains_key(&info.id);
             let block = self.blocks.entry(info.id.clone()).or_default();
+            // A block made since the last listing may be a worker whose
+            // `block_created` event hasn't arrived yet: one spawned while the
+            // roster was deciding to exit. It gets the same grace.
+            if !known && self.listed {
+                block.created.get_or_insert(now);
+            }
             if !block.fetched {
                 block.fetched = true;
                 fresh.push(info.id.clone());
@@ -286,6 +297,7 @@ impl Model {
                 }
             }
         }
+        self.listed = true;
         self.note_workers();
         Ok(())
     }
@@ -360,20 +372,21 @@ impl Model {
     }
 
     /// The roster is done once it has had workers and has none left, or when
-    /// it never got one within the startup grace. A block created within the
-    /// grace that hasn't sent a meta record yet may be a worker still starting,
-    /// so it keeps the roster open.
+    /// it never got one within the startup grace. Either way, a block created
+    /// within the grace that hasn't sent a meta record yet may be a worker
+    /// still starting, so it keeps the roster open.
     pub fn should_exit(&self, now: u64) -> bool {
-        if self.had_workers {
-            let starting = self.blocks.values().any(|b| {
-                b.meta().is_none()
-                    && b.created
-                        .is_some_and(|t| now.saturating_sub(t) < STARTUP_GRACE_SECS)
-            });
-            self.workers().next().is_none() && !starting
+        let starting = self.blocks.values().any(|b| {
+            b.meta().is_none()
+                && b.created
+                    .is_some_and(|t| now.saturating_sub(t) < STARTUP_GRACE_SECS)
+        });
+        let done = if self.had_workers {
+            self.workers().next().is_none()
         } else {
             now.saturating_sub(self.started) >= STARTUP_GRACE_SECS
-        }
+        };
+        done && !starting
     }
 }
 
@@ -774,6 +787,28 @@ mod tests {
         m.apply(Event::BlockClosed("block:a".into()), 11);
         assert!(!m.should_exit(10 + STARTUP_GRACE_SECS - 1));
         assert!(m.should_exit(10 + STARTUP_GRACE_SECS));
+    }
+
+    #[test]
+    fn a_block_first_found_by_a_later_listing_holds_the_roster_for_the_grace() {
+        // Its `block_created` event hasn't arrived: say it was spawned while
+        // the roster was deciding to exit. Blocks in the first listing were
+        // there before the roster, so they don't count.
+        let rex = Fake::default();
+        rex.on(
+            "session.list_blocks",
+            json!({"blocks": [{"block_id": "block:old", "label": "x"}]}),
+        );
+        let mut m = Model::new(LEAD.into(), None, 0);
+        m.refresh(&rex, "s", 0).unwrap();
+        assert!(m.should_exit(STARTUP_GRACE_SECS));
+        rex.on(
+            "session.list_blocks",
+            json!({"blocks": [{"block_id": "block:old", "label": "x"}, {"block_id": "block:new", "label": "w"}]}),
+        );
+        m.refresh(&rex, "s", STARTUP_GRACE_SECS).unwrap();
+        assert!(!m.should_exit(2 * STARTUP_GRACE_SECS - 1));
+        assert!(m.should_exit(2 * STARTUP_GRACE_SECS));
     }
 
     #[test]
