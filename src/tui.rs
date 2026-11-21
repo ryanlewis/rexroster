@@ -106,6 +106,9 @@ struct App<'a> {
     /// A problem loading or saving the config file. It goes on the next key
     /// press only, so an unrelated refresh can't hide it.
     config_error: Option<String>,
+    /// A revert that failed, or giving up on reverts. Like `config_error`, it
+    /// goes on the next key press only.
+    pin_error: Option<String>,
     fit: Fit,
     row_scale: size::RowScale,
     /// The `session.view` this pass fetched, so a fit in the same pass
@@ -221,6 +224,7 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         last_click: None,
         error: None,
         config_error: settings.error,
+        pin_error: None,
         fit: Fit::default(),
         row_scale: size::RowScale::default(),
         view: None,
@@ -246,6 +250,9 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
                 blocks: false,
             });
             let result = app.run(&mut terminal, &rx);
+            // Nothing reverts once the roster is gone, and the next spawn
+            // pins afresh, so drop the pin however the roster ends.
+            pin::release(&app.pin);
             let _ = restore_input(&mut std::io::stdout());
             ratatui::restore();
             result
@@ -277,8 +284,6 @@ impl App<'_> {
         loop {
             let rows = self.model.rows(now());
             if self.model.should_exit(now()) {
-                // No workers left, so a rename now is the lead's to keep.
-                pin::release(&self.pin);
                 return Ok(());
             }
             let lines = if self.panel.is_some() {
@@ -327,11 +332,12 @@ impl App<'_> {
             Decision::Keep => {}
             Decision::Revert(to) => {
                 if let Err(err) = pin::rename(self.rex, &self.session, &to) {
-                    self.error = Some(format!("{err:#}"));
+                    self.guard.forget_last();
+                    self.pin_error = Some(format!("{err:#}"));
                 }
             }
             Decision::GiveUp => {
-                self.error = Some(format!(
+                self.pin_error = Some(format!(
                     "renamed {} times in {}s; leaving it as {label}. rexroster pin keeps a new name",
                     pin::MAX_REVERTS,
                     pin::WINDOW_SECS
@@ -375,7 +381,10 @@ impl App<'_> {
 
     /// The error on the footer line, if any.
     fn shown_error(&self) -> Option<&str> {
-        self.error.as_deref().or(self.config_error.as_deref())
+        self.error
+            .as_deref()
+            .or(self.config_error.as_deref())
+            .or(self.pin_error.as_deref())
     }
 
     /// The last line shows key hints while focused, and an error whenever
@@ -500,6 +509,7 @@ impl App<'_> {
             TermEvent::Key(k) if k.kind == KeyEventKind::Press => {
                 self.error = None;
                 self.config_error = None;
+                self.pin_error = None;
                 let ctrl_c =
                     k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
                 if ctrl_c || (k.code == KeyCode::Char('q') && self.panel.is_none()) {
@@ -1094,6 +1104,7 @@ mod tests {
             last_click: None,
             error: None,
             config_error: None,
+            pin_error: None,
             fit: Fit::default(),
             row_scale: size::RowScale::default(),
             view: None,
@@ -1139,6 +1150,63 @@ mod tests {
         // Our own rename comes back as the pinned label: nothing more.
         a.on_label("lead name");
         assert_eq!(rex.params("session.set_label").len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn live_worker(a: &mut App) {
+        let meta = crate::model::Record {
+            app: "rexlead".into(),
+            state: "idle".into(),
+            msg: Some(r#"{"lead":"block:lead"}"#.into()),
+            updated_at: None,
+        };
+        a.model.apply(
+            Event::Status {
+                block: "block:w".into(),
+                id: "meta".into(),
+                record: meta,
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn the_give_up_notice_survives_a_refresh_in_the_same_pass() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let dir = crate::lock::temp_dir("tui-give-up");
+        a.pin = dir.join("pin");
+        pin::write(&a.pin, "lead name").unwrap();
+        live_worker(&mut a);
+        for _ in 0..=pin::MAX_REVERTS {
+            a.on_label("someone");
+        }
+        a.sync(Needs {
+            blocks: true,
+            view: false,
+        });
+        assert!(
+            a.shown_error()
+                .is_some_and(|e| e.contains("leaving it as someone"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_reverts_do_not_count_towards_giving_up() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let dir = crate::lock::temp_dir("tui-failed-revert");
+        a.pin = dir.join("pin");
+        pin::write(&a.pin, "lead name").unwrap();
+        live_worker(&mut a);
+        rex.fail("session.set_label");
+        for _ in 0..pin::MAX_REVERTS {
+            a.on_label("worker");
+        }
+        rex.heal();
+        a.on_label("worker");
+        assert_eq!(rex.params("session.set_label").len(), pin::MAX_REVERTS + 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

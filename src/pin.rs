@@ -98,6 +98,11 @@ impl Guard {
         self.reverts.push_back(now);
         Decision::Revert(pin.to_owned())
     }
+
+    /// Don't count the last revert: it failed, so nobody was fought.
+    pub fn forget_last(&mut self) {
+        self.reverts.pop_back();
+    }
 }
 
 /// `rexroster pin`: pin `label`, renaming the session to it, or with no
