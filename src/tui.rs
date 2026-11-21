@@ -1139,7 +1139,6 @@ mod tests {
         // Our own rename comes back as the pinned label: nothing more.
         a.on_label("lead name");
         assert_eq!(rex.params("session.set_label").len(), 1);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn live_worker(a: &mut App) {
@@ -1178,7 +1177,6 @@ mod tests {
             a.shown_error()
                 .is_some_and(|e| e.contains("leaving it as someone"))
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1196,7 +1194,6 @@ mod tests {
         rex.heal();
         a.on_label("worker");
         assert_eq!(rex.params("session.set_label").len(), pin::MAX_REVERTS + 1);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn render(app: &mut App, rows: &[Row]) -> String {

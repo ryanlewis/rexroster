@@ -125,6 +125,5 @@ mod tests {
         let rex = Command::new("/nonexistent/rex");
         run(rex, Notify::None, &path).unwrap();
         assert!(!start(Path::new("/nonexistent/rexroster"), &path).unwrap());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
