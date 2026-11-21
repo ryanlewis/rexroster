@@ -139,10 +139,25 @@ pub fn run(
         _ => rename(rex, session, &label),
     });
     if let Err(err) = renamed {
-        // The session keeps its old name, so it keeps its old pin too.
-        match before {
-            Some(b) => write(&pin, &b)?,
-            None => release(&pin),
+        // The rename may have landed and only its reply got lost. Then the
+        // session has the new name, and putting the old pin back would have
+        // the roster rename it back.
+        if session_label(rex, session).is_ok_and(|c| c.as_deref() == Some(&label)) {
+            return Ok(label);
+        }
+        // The session keeps its old name, so it keeps its old pin too,
+        // unless someone else has written the pin since.
+        if read(&pin).as_deref() == Some(&label) {
+            match before {
+                Some(b) => {
+                    if let Err(e) = write(&pin, &b) {
+                        return Err(
+                            err.context(format!("and putting the old pin back failed: {e:#}"))
+                        );
+                    }
+                }
+                None => release(&pin),
+            }
         }
         return Err(err);
     }
@@ -244,5 +259,62 @@ mod tests {
         write(&p, "old").unwrap();
         assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
         assert_eq!(read(&p).as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn a_rename_whose_reply_was_lost_keeps_the_new_pin() {
+        let dir = lock::temp_dir("pin-run-lost-reply");
+        let p = path(&dir, "s", "L");
+        write(&p, "old").unwrap();
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker-name"}));
+        // The rename lands, then its reply fails.
+        rex.on_call("session.set_label", |f| {
+            f.on("session.view", json!({"label": "mine"}))
+        });
+        rex.fail("session.set_label");
+        assert_eq!(run(&rex, "s", "L", Some("mine"), &dir).unwrap(), "mine");
+        assert_eq!(read(&p).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_a_pin_someone_else_wrote() {
+        let dir = lock::temp_dir("pin-run-concurrent");
+        let p = path(&dir, "s", "L");
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker-name"}));
+        // Another pin or a spawn writes the pin while our rename is out.
+        let q = p.clone();
+        rex.on_call("session.set_label", move |_| write(&q, "theirs").unwrap());
+        rex.fail("session.set_label");
+        assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
+        assert_eq!(read(&p).as_deref(), Some("theirs"));
+        write(&p, "old").unwrap();
+        assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
+        assert_eq!(read(&p).as_deref(), Some("theirs"));
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_the_rename_error() {
+        let dir = lock::temp_dir("pin-run-restore-fails");
+        let p = path(&dir, "s", "L");
+        write(&p, "old").unwrap();
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker-name"}));
+        // A non-empty directory where the restore's temp file goes makes
+        // writing the old pin back fail, even as root.
+        let mut tmp = p.as_os_str().to_owned();
+        tmp.push(format!(".tmp-{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        rex.on_call("session.set_label", move |_| {
+            std::fs::create_dir_all(tmp.join("x")).unwrap()
+        });
+        rex.fail("session.set_label");
+        let err = run(&rex, "s", "L", Some("mine"), &dir).unwrap_err();
+        assert_eq!(err.root_cause().to_string(), "session.set_label: boom");
+        assert!(
+            format!("{err:#}").contains("putting the old pin back failed"),
+            "{err:#}"
+        );
     }
 }

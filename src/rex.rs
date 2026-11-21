@@ -213,18 +213,30 @@ pub mod fake {
 
     use super::*;
 
+    type Effect = Box<dyn Fn(&Fake)>;
+
     #[derive(Default)]
     pub struct Fake {
         pub responses: RefCell<HashMap<String, Value>>,
         pub calls: RefCell<Vec<(String, Value)>>,
         /// Methods that fail, keyed like `responses`.
         pub failing: RefCell<Vec<String>>,
+        /// Side effects run when a method is called, before it answers.
+        pub effects: RefCell<HashMap<String, Effect>>,
     }
 
     impl Fake {
         /// Make `method` fail until [`Fake::heal`].
         pub fn fail(&self, method: &str) {
             self.failing.borrow_mut().push(method.to_owned());
+        }
+
+        /// Run `effect` whenever `method` is called, before it answers or
+        /// fails: a call that took effect even though its reply was lost.
+        pub fn on_call(&self, method: &str, effect: impl Fn(&Fake) + 'static) {
+            self.effects
+                .borrow_mut()
+                .insert(method.to_owned(), Box::new(effect));
         }
 
         pub fn heal(&self) {
@@ -266,6 +278,9 @@ pub mod fake {
     impl Rex for Fake {
         fn call(&self, method: &str, params: Value) -> Result<Value> {
             self.calls.borrow_mut().push((method.to_owned(), params));
+            if let Some(effect) = self.effects.borrow().get(method) {
+                effect(self);
+            }
             self.answer(method)
         }
 
