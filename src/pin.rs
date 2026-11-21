@@ -33,11 +33,22 @@ pub fn read(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok().filter(|s| !s.is_empty())
 }
 
+/// Write the pin to a temp file beside it and rename it into place, so a
+/// reader sees the old label or the new one, never part of one.
 pub fn write(path: &Path, label: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         lock::make_dir(dir)?;
     }
-    std::fs::write(path, label).with_context(|| format!("writing {}", path.display()))
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let res = std::fs::write(&tmp, label)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .with_context(|| format!("writing {}", path.display()));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Drop the pin. A missing file is fine.
@@ -196,6 +207,10 @@ mod tests {
         assert_eq!(read(&p), None);
         write(&p, "my lead").unwrap();
         assert_eq!(read(&p).as_deref(), Some("my lead"));
+        write(&p, "new").unwrap();
+        assert_eq!(read(&p).as_deref(), Some("new"));
+        // The temp file was renamed into place, not left beside it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         release(&p);
         assert_eq!(read(&p), None);
         std::fs::remove_dir_all(&dir).unwrap();
