@@ -64,7 +64,10 @@ pub fn parse(line: &str) -> Option<Event> {
         "block_created" => Some(Event::BlockCreated(block()?)),
         "block_closed" => Some(Event::BlockClosed(block()?)),
         "session_view_changed" => Some(Event::ViewChanged),
-        "session_label_changed" => Some(Event::SessionLabel(payload["label"].as_str()?.to_owned())),
+        // A cleared name may come with no label at all; it is still a change.
+        "session_label_changed" => Some(Event::SessionLabel(
+            payload["label"].as_str().unwrap_or_default().to_owned(),
+        )),
         "block_event" => block_event(block()?, payload),
         t if t.starts_with("block_label") => Some(Event::BlockChanged(block()?)),
         _ => None,
@@ -156,6 +159,16 @@ mod tests {
         }
         assert!(events.contains(&Event::ViewChanged));
         assert!(events.contains(&Event::SessionLabel("worker-renamed-me".into())));
+    }
+
+    #[test]
+    fn a_cleared_session_label_is_an_empty_label() {
+        for payload in [r#"{"label":""}"#, r#"{"label":null}"#, "{}"] {
+            let line = format!(
+                r#"{{"type":"session_event","payload":{{"event":{{"type":"session_label_changed","payload":{payload}}}}}}}"#
+            );
+            assert_eq!(parse(&line), Some(Event::SessionLabel(String::new())));
+        }
     }
 
     #[test]
