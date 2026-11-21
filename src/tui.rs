@@ -23,6 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::config::{self, Border, Key, Options, View};
 use crate::events::{self, Event};
 use crate::model::{Model, Needs, Row, short_age};
+use crate::pin::{self, Decision};
 use crate::rex::{self, Rex};
 use crate::size;
 
@@ -118,6 +119,9 @@ struct App<'a> {
     /// The options panel, while it is open, and where its options were drawn.
     panel: Option<Panel>,
     panel_area: Rect,
+    /// The lead's pinned session label, and the guard that decides reverts.
+    pin: PathBuf,
+    guard: pin::Guard,
 }
 
 /// What `rexroster` starts the TUI with.
@@ -126,6 +130,8 @@ pub struct Settings {
     pub path: Option<PathBuf>,
     /// A problem loading the config file, shown on the footer line.
     pub error: Option<String>,
+    /// The lead's pin file.
+    pub pin: PathBuf,
 }
 
 /// The options panel: which option the cursor is on, and the options as they
@@ -223,6 +229,8 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         config_path: settings.path,
         panel: None,
         panel_area: Rect::default(),
+        pin: settings.pin,
+        guard: pin::Guard::default(),
     };
     let result = app
         .model
@@ -269,6 +277,8 @@ impl App<'_> {
         loop {
             let rows = self.model.rows(now());
             if self.model.should_exit(now()) {
+                // No workers left, so a rename now is the lead's to keep.
+                pin::release(&self.pin);
                 return Ok(());
             }
             let lines = if self.panel.is_some() {
@@ -293,6 +303,7 @@ impl App<'_> {
             let mut needs = Needs::default();
             for msg in first.into_iter().chain(rx.try_iter()) {
                 match msg {
+                    Msg::Rex(Some(Event::SessionLabel(label))) => self.on_label(&label),
                     Msg::Rex(Some(event)) => needs = needs.or(self.model.apply(event, now())),
                     Msg::Rex(None) => bail!("rex events stopped"),
                     Msg::Term(ev) => {
@@ -303,6 +314,29 @@ impl App<'_> {
                 }
             }
             self.sync(needs);
+        }
+    }
+
+    /// Put the pinned label back if a worker renamed the session.
+    fn on_label(&mut self, label: &str) {
+        let pinned = pin::read(&self.pin);
+        match self
+            .guard
+            .decide(label, pinned.as_deref(), self.model.has_workers(), now())
+        {
+            Decision::Keep => {}
+            Decision::Revert(to) => {
+                if let Err(err) = pin::rename(self.rex, &self.session, &to) {
+                    self.error = Some(format!("{err:#}"));
+                }
+            }
+            Decision::GiveUp => {
+                self.error = Some(format!(
+                    "renamed {} times in {}s; leaving it as {label}. rexroster pin keeps a new name",
+                    pin::MAX_REVERTS,
+                    pin::WINDOW_SECS
+                ));
+            }
         }
     }
 
@@ -1068,7 +1102,44 @@ mod tests {
             config_path: None,
             panel: None,
             panel_area: Rect::default(),
+            pin: crate::lock::temp_dir("tui-pin").join("pin"),
+            guard: pin::Guard::default(),
         }
+    }
+
+    #[test]
+    fn puts_the_pinned_label_back_only_while_a_worker_is_live() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let dir = crate::lock::temp_dir("tui-on-label");
+        a.pin = dir.join("pin");
+        pin::write(&a.pin, "lead name").unwrap();
+        // No workers yet: a rename sticks.
+        a.on_label("worker-1");
+        assert!(rex.params("session.set_label").is_empty());
+        let meta = crate::model::Record {
+            app: "rexlead".into(),
+            state: "idle".into(),
+            msg: Some(r#"{"lead":"block:lead"}"#.into()),
+            updated_at: None,
+        };
+        a.model.apply(
+            Event::Status {
+                block: "block:w".into(),
+                id: "meta".into(),
+                record: meta,
+            },
+            0,
+        );
+        a.on_label("worker-1");
+        assert_eq!(
+            rex.params("session.set_label"),
+            [json!({"session_id": "s", "label": "lead name"})]
+        );
+        // Our own rename comes back as the pinned label: nothing more.
+        a.on_label("lead name");
+        assert_eq!(rex.params("session.set_label").len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn render(app: &mut App, rows: &[Row]) -> String {

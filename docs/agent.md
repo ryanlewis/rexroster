@@ -113,6 +113,22 @@ rexroster open "$REX_BLOCK"
 
 It prints the new layer id, or nothing if one is already open.
 
+## The session name
+
+Your workers are blocks in your session, so a worker that renames "its"
+session renames yours. `spawn` pins your session's name before your first
+worker starts, and while you have live workers the roster puts that name back
+whenever the session is renamed. The pin is released when your last worker's
+block closes. To change the name on purpose during a run:
+
+```sh
+rexroster pin "$REX_BLOCK" '<new name>'   # pin it and rename the session
+rexroster pin "$REX_BLOCK"                # keep the session's current name
+```
+
+Without `pin`, a rename during a run is reverted. After 5 reverts in a minute
+the roster stops reverting for a while and shows why.
+
 ## The watcher
 
 `rexroster watch` runs in the background, one per user per Rex server; `spawn`

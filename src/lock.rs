@@ -18,14 +18,19 @@ pub struct Lock {
     file: File,
 }
 
+/// Create `dir` closed to others, or check that it already is.
+pub fn make_dir(dir: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    check_private(dir)
+}
+
 fn open(path: &Path) -> Result<File> {
     if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
-        check_private(dir)?;
+        make_dir(dir)?;
     }
     OpenOptions::new()
         .read(true)

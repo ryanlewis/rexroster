@@ -232,6 +232,8 @@ impl Model {
                 self.blocks.remove(&block);
                 Needs::default()
             }
+            // The roster handles renames itself; the rows don't change.
+            Event::SessionLabel(_) => Needs::default(),
             Event::Status { block, id, record } => {
                 self.blocks
                     .entry(block)
@@ -289,7 +291,7 @@ impl Model {
     }
 
     fn note_workers(&mut self) {
-        if !self.had_workers && self.workers().next().is_some() {
+        if !self.had_workers && self.has_workers() {
             self.had_workers = true;
         }
     }
@@ -298,6 +300,11 @@ impl Model {
     /// roster are never in `blocks`, so this is all a worker needs.
     fn is_ours(&self, b: &Block) -> bool {
         b.meta().is_some_and(|m| m.lead == self.lead)
+    }
+
+    /// Whether any of our workers is live.
+    pub fn has_workers(&self) -> bool {
+        self.workers().next().is_some()
     }
 
     fn workers(&self) -> impl Iterator<Item = (&String, &Block)> {
