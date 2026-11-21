@@ -9,8 +9,8 @@
 pub const MAX_HEIGHT: f64 = 0.6;
 /// The fewest rows the layer shrinks to: one line plus about a row of window chrome.
 pub const MIN_ROWS: f64 = 2.0;
-/// The fewest columns the roster's terminal should have. Below this, a
-/// compact row has little room left for the message.
+/// The fewest columns the roster's terminal should have. Below this, the
+/// key hints and the expanded view's messages are cut short.
 pub const MIN_COLUMNS: u16 = 50;
 
 use std::time::Duration;

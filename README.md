@@ -78,10 +78,9 @@ By default the roster has no frame or title, because Rex's pane title already na
 - a glyph for the state of the worker's root status record (the one Claude Code reports): a turning braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) while working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
 - `▸` if the worker is shown
 - the label, in a column as wide as the longest label (6 to 20 characters)
-- the time in the current state
-- the record's message, or the task when there is no message, cut with `…` to fit. When the record carries the worker's `cwd`, that path in the message shows as `.`, and a leading `cd <cwd> && ` or `cd <cwd>; ` is dropped.
+- how long it has been in its state, except while it is working, when this is blank
 
-Press `v` for the expanded view. Each worker then has a line with its label and time, then its message wrapped to the pane width (at most 3 lines), then its task in dim text if that differs from the message.
+Press `v` for the expanded view. Each worker then has a line with its label and time, then the record's message wrapped to the pane width (at most 3 lines), then its task in dim text if that differs from the message. When there is no message, the task takes its place. When the record carries the worker's `cwd`, that path in the message shows as `.`, and a leading `cd <cwd> && ` or `cd <cwd>; ` is dropped.
 
 | Key | Action |
 | --- | --- |
