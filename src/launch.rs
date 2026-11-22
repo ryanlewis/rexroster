@@ -167,8 +167,12 @@ pub fn pin_label(rex: &dyn Rex, session: &str, lead: &str, lock_dir: &Path) -> R
 
 /// Start a detached worker block, then open the roster. The open lock is
 /// held throughout, so a roster deciding to exit either sees the new worker
-/// and stays, or has left (dropped its label and the pin) before the pin
-/// check, and this spawn pins afresh and opens a new roster.
+/// and stays, or has left before the pin check. A roster that left by
+/// giving up its label also dropped the pin, so this spawn pins afresh and
+/// opens a new roster. One that couldn't relabel kept both, so while its
+/// block is still listed this spawn keeps the pin and opens none. A roster
+/// whose listing kept failing may exit without seeing the new worker if its
+/// event hadn't arrived yet.
 pub fn spawn(
     rex: &dyn Rex,
     session: &str,
