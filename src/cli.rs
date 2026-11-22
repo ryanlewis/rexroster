@@ -131,8 +131,14 @@ pub enum Command {
     /// worker sessions. Needs no Rex session.
     Skill,
     /// Print a Lua snippet that adds rexroster's actions to Rex's command
-    /// palette, for Rex's init.lua to load. Needs no Rex session.
-    Lua,
+    /// palette, for Rex's init.lua to load (or, with --loader, a loader that
+    /// fetches it). Needs no Rex session.
+    Lua {
+        /// Print a loader for init.lua instead: it runs `rexroster lua` at
+        /// config load, so the actions follow the installed binary.
+        #[arg(long)]
+        loader: bool,
+    },
 }
 
 #[cfg(test)]

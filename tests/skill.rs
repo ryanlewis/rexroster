@@ -49,3 +49,20 @@ fn lua_prints_the_snippet_without_a_rex_session() {
     assert!(text.starts_with("local REXROSTER = \""), "{text}");
     assert!(text.contains("roster_show_worker"));
 }
+
+#[test]
+fn lua_loader_prints_a_loader_without_a_rex_session() {
+    let out = Command::new(env!("CARGO_BIN_EXE_rexroster"))
+        .args(["lua", "--loader"])
+        .env_remove("REX_SESSION")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(r#", "lua" }, { timeout = 5 })"#), "{text}");
+    assert!(!text.contains("roster_show_worker"), "{text}");
+}

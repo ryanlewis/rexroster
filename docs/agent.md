@@ -130,7 +130,7 @@ Without `pin`, a rename during a run is reverted. After 5 reverts in a minute
 the roster stops reverting for a while and shows why.
 
 The user may have rexroster's palette actions loaded (`rexroster lua` prints
-them, for Rex's init.lua): "Roster: Rename session…" renames through the pin,
+them; `rexroster lua --loader` prints what Rex's init.lua loads them with): "Roster: Rename session…" renames through the pin,
 and "Roster: Show worker…" shows one of your workers. You don't need them;
 use `rexroster pin` and the commands above.
 
