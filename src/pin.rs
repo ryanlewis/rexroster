@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -116,15 +117,31 @@ impl Guard {
     }
 }
 
+/// How many times [`run`] reads the label to learn whether a rename whose
+/// reply failed landed, and how long it waits between tries.
+const RECHECK_TRIES: usize = 3;
+const RECHECK_DELAY: Duration = Duration::from_millis(if cfg!(test) { 0 } else { 250 });
+
+/// What [`run`] pinned.
+#[derive(Debug)]
+pub struct Pinned {
+    pub label: String,
+    /// Set when the rename's reply failed and re-reading the label failed
+    /// too, so nobody knows whether the session has the new name. The new
+    /// pin is kept, so a rename that landed isn't reverted. One that didn't
+    /// land leaves the session on its old name until someone renames it.
+    pub warning: Option<String>,
+}
+
 /// `rexroster pin`: pin `label`, renaming the session to it, or with no
-/// label pin the session's current one. Returns the pinned label.
+/// label pin the session's current one.
 pub fn run(
     rex: &dyn Rex,
     session: &str,
     lead: &str,
     label: Option<&str>,
     dir: &Path,
-) -> Result<String> {
+) -> Result<Pinned> {
     if label == Some("") {
         anyhow::bail!("the label is empty");
     }
@@ -141,35 +158,61 @@ pub fn run(
     // Pin first, so the roster sees our rename as the pinned label.
     let before = read(&pin);
     write(&pin, &label)?;
-    let renamed = session_label(rex, session).and_then(|current| match current {
-        Some(c) if c == label => Ok(()),
-        _ => rename(rex, session, &label),
-    });
-    if let Err(err) = renamed {
-        // The rename may have landed and only its reply got lost. Then the
-        // session has the new name, and putting the old pin back would have
-        // the roster rename it back.
-        if session_label(rex, session).is_ok_and(|c| c.as_deref() == Some(&label)) {
+    let err = match apply(rex, session, &label) {
+        Ok(warning) => return Ok(Pinned { label, warning }),
+        Err(err) => err,
+    };
+    // The session keeps its old name, so it keeps its old pin too, unless
+    // the pin was written since by a writer that couldn't take the lock,
+    // such as a roster leaving without it.
+    if read(&pin).as_deref() == Some(&label) {
+        match before {
+            Some(b) => {
+                if let Err(e) = write(&pin, &b) {
+                    return Err(err.context(format!(
+                        "renaming the session failed, and putting the old pin back failed too: {e:#}"
+                    )));
+                }
+            }
+            None => release(&pin),
+        }
+    }
+    Err(err)
+}
+
+/// Rename the session to `label` unless it already has it. `Ok(None)` when
+/// the session has the label, `Ok(Some(warning))` when whether the rename
+/// landed is unknown, and `Err` when the session keeps its old name.
+fn apply(rex: &dyn Rex, session: &str, label: &str) -> Result<Option<String>> {
+    // An error here means no rename was sent, so the session keeps its old
+    // name.
+    if session_label(rex, session)?.as_deref() == Some(label) {
+        return Ok(None);
+    }
+    let Err(err) = rename(rex, session, label) else {
+        return Ok(None);
+    };
+    // The rename may have landed and only its reply got lost. Then the
+    // session has the new name, and putting the old pin back would have the
+    // roster rename it back.
+    match recheck(rex, session) {
+        Ok(c) if c.as_deref() == Some(label) => Ok(None),
+        Ok(_) => Err(err),
+        Err(e) => Ok(Some(format!(
+            "pinned {label:?}, but whether the session was renamed to it is unknown: {err:#}; reading the label back failed too: {e:#}"
+        ))),
+    }
+}
+
+/// The session's label, retrying a failed read a few times.
+fn recheck(rex: &dyn Rex, session: &str) -> Result<Option<String>> {
+    for _ in 1..RECHECK_TRIES {
+        if let Ok(label) = session_label(rex, session) {
             return Ok(label);
         }
-        // The session keeps its old name, so it keeps its old pin too,
-        // unless the pin was written since by a writer that couldn't take
-        // the lock, such as a roster leaving without it.
-        if read(&pin).as_deref() == Some(&label) {
-            match before {
-                Some(b) => {
-                    if let Err(e) = write(&pin, &b) {
-                        return Err(
-                            err.context(format!("renaming the session failed, and putting the old pin back failed too: {e:#}"))
-                        );
-                    }
-                }
-                None => release(&pin),
-            }
-        }
-        return Err(err);
+        std::thread::sleep(RECHECK_DELAY);
     }
-    Ok(label)
+    session_label(rex, session)
 }
 
 #[cfg(test)]
@@ -243,13 +286,19 @@ mod tests {
         let dir = lock::temp_dir("pin-run");
         let rex = Fake::default();
         rex.on("session.view", json!({"label": "worker-name"}));
-        assert_eq!(run(&rex, "s", "L", Some("mine"), &dir).unwrap(), "mine");
+        assert_eq!(
+            run(&rex, "s", "L", Some("mine"), &dir).unwrap().label,
+            "mine"
+        );
         assert_eq!(read(&path(&dir, "s", "L")).as_deref(), Some("mine"));
         assert_eq!(
             rex.params("session.set_label"),
             [json!({"session_id": "s", "label": "mine"})]
         );
-        assert_eq!(run(&rex, "s", "L", None, &dir).unwrap(), "worker-name");
+        assert_eq!(
+            run(&rex, "s", "L", None, &dir).unwrap().label,
+            "worker-name"
+        );
         assert_eq!(read(&path(&dir, "s", "L")).as_deref(), Some("worker-name"));
         // Already that label: no second rename.
         assert_eq!(rex.params("session.set_label").len(), 1);
@@ -281,7 +330,10 @@ mod tests {
             f.on("session.view", json!({"label": "mine"}))
         });
         rex.fail("session.set_label");
-        assert_eq!(run(&rex, "s", "L", Some("mine"), &dir).unwrap(), "mine");
+        assert_eq!(
+            run(&rex, "s", "L", Some("mine"), &dir).unwrap().label,
+            "mine"
+        );
         assert_eq!(read(&p).as_deref(), Some("mine"));
     }
 
@@ -339,7 +391,7 @@ mod tests {
         rex.on_call("session.view", move |_| {
             h.set(h.get() && lock::Lock::try_acquire(&l).unwrap().is_none())
         });
-        assert_eq!(run(&rex, "s", "L", None, &dir).unwrap(), "current");
+        assert_eq!(run(&rex, "s", "L", None, &dir).unwrap().label, "current");
         assert!(held.get(), "read the label without the open lock");
     }
 
@@ -365,5 +417,51 @@ mod tests {
             format!("{err:#}").contains("putting the old pin back failed too"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn a_rename_whose_outcome_is_unknown_keeps_the_new_pin() {
+        let dir = lock::temp_dir("pin-run-unknown");
+        let p = path(&dir, "s", "L");
+        write(&p, "old").unwrap();
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker-name"}));
+        // The rename's reply is lost, and every re-check fails.
+        rex.on_call("session.set_label", |f| f.fail("session.view"));
+        rex.fail("session.set_label");
+        let pinned = run(&rex, "s", "L", Some("mine"), &dir).unwrap();
+        assert_eq!(pinned.label, "mine");
+        let warning = pinned.warning.expect("no warning");
+        assert!(warning.contains("unknown"), "{warning}");
+        assert_eq!(read(&p).as_deref(), Some("mine"));
+        assert_eq!(rex.params("session.view").len(), 1 + RECHECK_TRIES);
+    }
+
+    #[test]
+    fn a_lost_rename_reply_is_found_by_retrying_the_check() {
+        let dir = lock::temp_dir("pin-run-recheck-retry");
+        let p = path(&dir, "s", "L");
+        write(&p, "old").unwrap();
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker-name"}));
+        // The rename lands and its reply is lost.
+        rex.on_call("session.set_label", |f| {
+            f.on("session.view", json!({"label": "mine"}))
+        });
+        rex.fail("session.set_label");
+        // The first re-check (the second view) fails, the next one works.
+        let views = std::cell::Cell::new(0);
+        rex.on_call("session.view", move |f| {
+            views.set(views.get() + 1);
+            match views.get() {
+                2 => f.fail("session.view"),
+                3 => f.heal(),
+                _ => {}
+            }
+        });
+        let pinned = run(&rex, "s", "L", Some("mine"), &dir).unwrap();
+        assert_eq!(pinned.label, "mine");
+        assert_eq!(pinned.warning, None);
+        assert_eq!(read(&p).as_deref(), Some("mine"));
     }
 }
