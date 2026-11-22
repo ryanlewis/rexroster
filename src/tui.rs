@@ -66,6 +66,9 @@ pub const LABEL_MAX: usize = 20;
 /// The roster's block label once it is leaving, so `open` and `spawn` no
 /// longer take it for a live roster while its block closes.
 const LEAVING_LABEL: &str = "roster (closing)";
+/// How long every refresh that would confirm a pending exit may fail before
+/// the roster exits without one.
+const EXIT_UNCONFIRMED_AFTER: Duration = Duration::from_secs(30);
 
 /// What wakes the loop: an event from Rex (`None` when the stream ends) or
 /// terminal input. Both arrive on one channel, so either wakes it at once.
@@ -140,6 +143,9 @@ struct App<'a> {
     guard: pin::Guard,
     /// The open lock, held from deciding to exit until the roster has left.
     leaving: Option<Lock>,
+    /// When the refreshes confirming a pending exit started failing, if the
+    /// last one failed.
+    confirm_failing_since: Option<Instant>,
     follow: Follow,
     /// Where the reset control was drawn; empty while it isn't shown.
     reset_area: Rect,
@@ -278,6 +284,7 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         pin: settings.pin,
         guard: pin::Guard::default(),
         leaving: None,
+        confirm_failing_since: None,
         follow: Follow::default(),
         reset_area: Rect::default(),
     };
@@ -295,8 +302,8 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
                 blocks: false,
             });
             let result = app.run(&mut terminal, &rx);
-            // Nothing reverts once the roster is gone, and the next spawn
-            // pins afresh, so leave (and drop the pin) however the roster ends.
+            // Nothing reverts once the roster is gone, so leave however the
+            // roster ends. The pin goes only if the roster's label did.
             app.leave();
             let _ = restore_input(&mut std::io::stdout());
             ratatui::restore();
@@ -328,7 +335,9 @@ impl App<'_> {
     fn run(&mut self, terminal: &mut DefaultTerminal, rx: &Receiver<Msg>) -> Result<()> {
         loop {
             let rows = self.model.rows(now());
-            if self.model.should_exit(now()) && self.confirm_exit() {
+            if !self.model.should_exit(now()) {
+                self.confirm_failing_since = None;
+            } else if self.confirm_exit(Instant::now()) {
                 return Ok(());
             }
             let lines = if self.panel.is_some() {
@@ -368,14 +377,25 @@ impl App<'_> {
         }
     }
 
-    /// Check again under the open lock, against a fresh listing, that the
-    /// roster is done: a worker spawned since the last event keeps it. When
-    /// it is, the lock stays held until [`App::leave`], so no spawn runs in
-    /// between. Without the lock it exits anyway, as it would have before.
-    fn confirm_exit(&mut self) -> bool {
+    /// Called while the model says the roster is done. Under the open lock,
+    /// refresh the listing and exit only if the roster is still done: a
+    /// worker spawned since the last event keeps it. If the refresh fails,
+    /// stay and show the error, unless every refresh since the first failed
+    /// one (`at` is now) has failed for [`EXIT_UNCONFIRMED_AFTER`]: then exit
+    /// anyway. A refresh that works restarts that wait. On exit the lock
+    /// stays held until [`App::leave`], so no spawn runs in between. Without
+    /// the lock it exits all the same.
+    fn confirm_exit(&mut self, at: Instant) -> bool {
         let lock = Lock::acquire(&launch::open_lock(&self.pin));
         let res = self.model.refresh(self.rex, &self.session, now());
-        let exit = res.is_ok() && self.model.should_exit(now());
+        let confirmed = if res.is_ok() {
+            self.confirm_failing_since = None;
+            true
+        } else {
+            let since = *self.confirm_failing_since.get_or_insert(at);
+            at.saturating_duration_since(since) >= EXIT_UNCONFIRMED_AFTER
+        };
+        let exit = confirmed && self.model.should_exit(now());
         self.report(res);
         if exit {
             self.leaving = lock.ok();
@@ -385,19 +405,25 @@ impl App<'_> {
 
     /// Leave for good, under the open lock: give up the roster's label, so a
     /// spawn after this finds no roster, pins afresh and opens a new one,
-    /// then drop the pin.
+    /// then drop the pin. If the label can't be given up (Rex fails, or the
+    /// roster doesn't know its block), the pin stays: a spawn still sees
+    /// this roster and keeps the pin, and replaces it once the block is gone.
     fn leave(&mut self) {
         let _lock = self
             .leaving
             .take()
             .or_else(|| Lock::acquire(&launch::open_lock(&self.pin)).ok());
-        if let Some(me) = &self.model.me {
-            let _ = self.rex.call(
-                "session.set_block_label",
-                json!({ "session_id": self.session, "block_id": me, "label": LEAVING_LABEL }),
-            );
+        let relabelled = self.model.me.as_ref().is_some_and(|me| {
+            self.rex
+                .call(
+                    "session.set_block_label",
+                    json!({ "session_id": self.session, "block_id": me, "label": LEAVING_LABEL }),
+                )
+                .is_ok()
+        });
+        if relabelled {
+            pin::release(&self.pin);
         }
-        pin::release(&self.pin);
     }
 
     /// Put the pinned label back if a worker renamed the session.
@@ -1400,6 +1426,7 @@ mod tests {
             pin: crate::lock::temp_dir("tui-pin").join("pin"),
             guard: pin::Guard::default(),
             leaving: None,
+            confirm_failing_since: None,
             follow: Follow::default(),
             reset_area: Rect::default(),
         }
@@ -1623,7 +1650,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
                 open_gate.send(()).unwrap();
             });
-            let exit = a.confirm_exit();
+            let exit = a.confirm_exit(Instant::now());
             if exit {
                 a.leave();
             }
@@ -1649,7 +1676,7 @@ mod tests {
         let dir = crate::lock::temp_dir("tui-exit-race-after");
         let server = Server::default();
         let mut a = roster_whose_last_worker_closed(&server, &dir);
-        assert!(a.confirm_exit());
+        assert!(a.confirm_exit(Instant::now()));
         // No spawn can slip in between deciding to exit and leaving.
         let lock = launch::open_lock(&a.pin);
         *server.lock.lock().unwrap() = Some(lock.clone());
@@ -1661,6 +1688,101 @@ mod tests {
         let out = spawn_worker(&server, &dir);
         assert_eq!(out.json["roster_layer_id"], "layer:r2");
         assert_eq!(pin::read(&a.pin).as_deref(), Some("lead name"));
+    }
+
+    /// A roster on a fake Rex whose only worker has closed, with the lead's
+    /// name pinned: the model says exit.
+    fn fake_roster_done<'a>(rex: &'a Fake, dir: &Path) -> App<'a> {
+        let mut a = app(rex);
+        a.pin = dir.join("pin");
+        pin::write(&a.pin, "lead name").unwrap();
+        rex.on("session.list_blocks", json!({"blocks": []}));
+        a.model.refresh(rex, "s", now()).unwrap();
+        live_worker(&mut a);
+        a.model.apply(Event::BlockClosed("block:w".into()), now());
+        assert!(a.model.should_exit(now()));
+        a
+    }
+
+    #[test]
+    fn leaving_drops_the_pin_once_the_roster_is_relabelled() {
+        let rex = Fake::default();
+        let dir = crate::lock::temp_dir("tui-leave-ok");
+        let mut a = fake_roster_done(&rex, &dir);
+        a.leave();
+        assert_eq!(
+            rex.params("session.set_block_label"),
+            [json!({"session_id": "s", "block_id": "block:me", "label": LEAVING_LABEL})]
+        );
+        assert_eq!(pin::read(&a.pin), None);
+    }
+
+    #[test]
+    fn leaving_keeps_the_pin_when_the_relabel_fails() {
+        let rex = Fake::default();
+        let dir = crate::lock::temp_dir("tui-leave-fail");
+        let mut a = fake_roster_done(&rex, &dir);
+        rex.fail("session.set_block_label");
+        a.leave();
+        assert_eq!(rex.params("session.set_block_label").len(), 1);
+        assert_eq!(pin::read(&a.pin).as_deref(), Some("lead name"));
+    }
+
+    #[test]
+    fn leaving_without_its_own_block_keeps_the_pin() {
+        let rex = Fake::default();
+        let dir = crate::lock::temp_dir("tui-leave-no-me");
+        let mut a = fake_roster_done(&rex, &dir);
+        a.model.me = None;
+        a.leave();
+        assert!(rex.params("session.set_block_label").is_empty());
+        assert_eq!(pin::read(&a.pin).as_deref(), Some("lead name"));
+    }
+
+    #[test]
+    fn a_listing_that_keeps_failing_exits_after_the_window_and_keeps_the_pin() {
+        let rex = Fake::default();
+        let dir = crate::lock::temp_dir("tui-exit-failing");
+        let mut a = fake_roster_done(&rex, &dir);
+        rex.fail("session.list_blocks");
+        let t0 = Instant::now();
+        assert!(!a.confirm_exit(t0));
+        assert!(a.error.is_some());
+        assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER - Duration::from_secs(1)));
+        assert!(a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER));
+        // Rex is no better at relabelling: the pin stays for the next spawn.
+        rex.fail("session.set_block_label");
+        a.leave();
+        assert_eq!(pin::read(&a.pin).as_deref(), Some("lead name"));
+    }
+
+    #[test]
+    fn a_listing_that_works_restarts_the_wait() {
+        let rex = Fake::default();
+        let dir = crate::lock::temp_dir("tui-exit-reset");
+        let mut a = fake_roster_done(&rex, &dir);
+        rex.fail("session.list_blocks");
+        let t0 = Instant::now();
+        assert!(!a.confirm_exit(t0));
+        // The listing works again and shows a new worker, which keeps the roster.
+        rex.heal();
+        rex.on(
+            "session.list_blocks",
+            json!({"blocks": [{"block_id": "block:w2", "label": "w2", "placement": "detached"}]}),
+        );
+        rex.on(
+            "block:w2 program_status",
+            json!({"records": [{"id": "meta", "app": "rexlead", "state": "idle",
+                "msg": r#"{"lead":"block:lead"}"#}]}),
+        );
+        assert!(!a.confirm_exit(t0 + Duration::from_secs(20)));
+        // It closes and the listing fails again: the wait starts over.
+        a.model.apply(Event::BlockClosed("block:w2".into()), now());
+        assert!(a.model.should_exit(now()));
+        rex.fail("session.list_blocks");
+        let t1 = t0 + EXIT_UNCONFIRMED_AFTER + Duration::from_secs(1);
+        assert!(!a.confirm_exit(t1));
+        assert!(a.confirm_exit(t1 + EXIT_UNCONFIRMED_AFTER));
     }
 
     fn render(app: &mut App, rows: &[Row]) -> String {
