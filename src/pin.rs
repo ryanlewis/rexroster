@@ -125,16 +125,20 @@ pub fn run(
     label: Option<&str>,
     dir: &Path,
 ) -> Result<String> {
-    let label = match label {
-        Some(l) if !l.is_empty() => l.to_owned(),
-        Some(_) => anyhow::bail!("the label is empty"),
-        None => session_label(rex, session)?.context("the session has no label to pin")?,
-    };
-    // Pin first, so the roster sees our rename as the pinned label. The
-    // open lock, held to the end, keeps spawn, the roster's leave and other
-    // pins from writing the pin between our write and any restore.
+    if label == Some("") {
+        anyhow::bail!("the label is empty");
+    }
+    // The open lock, held to the end, keeps spawn, the roster's leave and
+    // other pins from writing the pin between our write and any restore.
+    // It is taken before the label is read, so a rename while we wait for
+    // it is the one we pin.
     let pin = path(dir, session, lead);
     let _lock = lock::Lock::acquire(&crate::launch::open_lock(&pin))?;
+    let label = match label {
+        Some(l) => l.to_owned(),
+        None => session_label(rex, session)?.context("the session has no label to pin")?,
+    };
+    // Pin first, so the roster sees our rename as the pinned label.
     let before = read(&pin);
     write(&pin, &label)?;
     let renamed = session_label(rex, session).and_then(|current| match current {
@@ -320,6 +324,23 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn pin_without_a_label_reads_it_under_the_open_lock() {
+        // Read before the lock, a rename while pin waits for it would be
+        // undone by pin renaming the session back to the stale label.
+        let dir = lock::temp_dir("pin-run-adopt-lock");
+        let p = path(&dir, "s", "L");
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "current"}));
+        let held = std::rc::Rc::new(std::cell::Cell::new(true));
+        let (h, l) = (held.clone(), crate::launch::open_lock(&p));
+        rex.on_call("session.view", move |_| {
+            h.set(h.get() && lock::Lock::try_acquire(&l).unwrap().is_none())
+        });
+        assert_eq!(run(&rex, "s", "L", None, &dir).unwrap(), "current");
+        assert!(held.get(), "read the label without the open lock");
     }
 
     #[test]
