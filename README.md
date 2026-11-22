@@ -113,7 +113,7 @@ rexroster has no key binding of its own. To move focus between a lead and its ro
 `rexroster watch` floats a detached worker into view when it is waiting on you, and puts it back when it moves on:
 
 - When a detached block's own status record turns `blocked` (for example a Claude Code permission prompt), the watcher moves it into its session's active window as a large floating pane.
-- When the record turns to any other state, or goes away, the watcher detaches the block again. If the block closed, there is nothing to do.
+- When the record turns to any other state, or goes away, the watcher detaches the block again. A sub-task record going away (a Claude Code subagent finishing, say) changes nothing. If the block closed, there is nothing to do.
 - Blocks that are already in a window are left alone.
 
 It watches every session on the Rex server, including ones created later. The work is done by a Lua script built into the binary ([`lua/blocked-float.lua`](lua/blocked-float.lua)). The watcher replaces itself with `rex do -e <script> --all`, so in a process list it shows as `rex do`.
