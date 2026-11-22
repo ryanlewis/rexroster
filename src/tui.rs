@@ -604,8 +604,9 @@ impl App<'_> {
     fn measure(&mut self, me: &str, view: &Value, bounds: [f64; 4]) -> Option<Measured> {
         let lead = &self.model.lead;
         // Zoomed, the lead fills more than its layout cell says.
-        let lead_h = match rex::tiled_area_of(view, lead) {
-            Some((_, area)) => area[3],
+        let shown = rex::tiled_area_of(view, lead).map(|(_, area)| area);
+        let lead_h = match shown {
+            Some(area) => area[3],
             None => rex::rect_height_of(view, lead)?,
         };
         let lead_size = self.rex.block_call(&self.session, lead, "size").ok()?;
@@ -625,7 +626,11 @@ impl App<'_> {
         let new_h = size::new_height(self.fit.want, rows, per_row, bounds[1], bounds[3]);
         // Older Rex servers may not report columns; then only the height fits.
         let per_col = (|| {
-            Some(rex::rect_width_of(view, lead)? / f64::from(rex::drawn_columns(&lead_size)?))
+            let lead_w = match shown {
+                Some(area) => area[2],
+                None => rex::rect_width_of(view, lead)?,
+            };
+            Some(lead_w / f64::from(rex::drawn_columns(&lead_size)?))
         })();
         self.follow.cell = [per_col.unwrap_or(0.0), per_row];
         let new_w = per_col.and_then(|per_col| {
@@ -1875,6 +1880,39 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((h - 0.16).abs() < 1e-9, "{h}");
+    }
+
+    #[test]
+    fn widens_to_a_zoomed_lead() {
+        let rex = Fake::default();
+        sized(&rex, 3);
+        // The lead's cell is half the window, 100 columns wide; zoomed, it
+        // draws 200 columns over the whole window: 0.005 a column.
+        let mut v: Value = serde_json::from_str(include_str!("../testdata/view.json")).unwrap();
+        v["windows"][0]["layers"][0]["layout"]["children"][0]["rect"] = json!([0, 0, 0.5, 1]);
+        v["windows"][0]["zoomed_block_id"] = json!("block:lead");
+        rex.on("session.view", v);
+        rex.on(
+            "block:lead size",
+            json!({"rows": 50, "columns": 200, "desired": [{"rows": 50}]}),
+        );
+        rex.on(
+            "block:roster size",
+            json!({"rows": 3, "columns": 20, "desired": [{"rows": 3}]}),
+        );
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        a.fit_layer();
+        assert!(
+            (a.follow.cell[0] - 0.005).abs() < 1e-9,
+            "{:?}",
+            a.follow.cell
+        );
+        let p = &rex.params("session.resize_layer")[0];
+        let missing = f64::from(size::MIN_COLUMNS - 20);
+        let w = p["bounds"][2].as_f64().unwrap();
+        assert!((w - (0.27 + missing * 0.005)).abs() < 1e-9, "{w}");
     }
 
     #[test]
