@@ -92,13 +92,13 @@ Press `v` for the expanded view. Each worker then has a line with its label and 
 | `r`, click `↺ reset` | Move the roster back to the lead's pane and follow it again, after you have dragged it |
 | `q`, `Ctrl-C` | Quit |
 
-A line of key hints shows at the bottom while the roster has focus. With a border, the hints sit on the bottom border instead.
+A line of key hints shows at the bottom while the roster has focus. With a border, the hints sit on the bottom border instead. Where the full hints don't fit, a short form shows the keys alone: `⏎ v o l r q`.
 
 To hide a shown worker, press `Enter` on it or minimize its pane: the roster turns a minimized worker back into a hidden one. Closing a worker's pane ends the worker.
 
 The roster's layer sits at the top right of the lead's pane, and moves with it when the layout changes: a split forms, a pane closes or is resized. When the lead is zoomed, the roster sits at the top right of the window. When the lead floats, is in another window, or has another pane zoomed over it, the roster stays where it is. Once you drag the roster somewhere else, it stays there and shows `↺ reset` at its top right; click it or press `r` to send it back. Resizing it by its left or bottom edge, or its bottom left corner, keeps it following; moving its top or right edge counts as a drag.
 
-The layer's height follows the lines the workers take, plus the hints line while focused, up to 60% of the window's height. If the roster's pane is narrower than 50 columns, the roster widens it to 50, growing to the left so it stays in the corner. It never narrows a pane you have widened. If the roster never gets a worker, it exits after 30 seconds.
+The layer's height follows the lines the workers take, plus the hints line while focused, up to 60% of the window's height. The width follows the view: in the compact view, the widest worker row plus a column, and at least 20 columns. In the expanded view it is 50 columns, for the messages, and while the options panel is open it is at least 30. The roster grows and shrinks its pane at the left edge, so it stays in the corner. It never narrows a pane you have resized yourself, until you press `r` or it reopens. If the roster never gets a worker, it exits after 30 seconds.
 
 The spinner redraws every 100 ms while any worker is working. Otherwise the roster wakes once a second to update the times.
 
