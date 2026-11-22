@@ -92,6 +92,7 @@ pub fn start(exe: &Path, lock: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{self, Event};
 
     #[test]
     fn the_preamble_sets_notify() {
@@ -132,8 +133,7 @@ mod tests {
     /// Rex (testdata/program-status.jsonl); the rest are shapes src/events.rs
     /// reads that Rex has not been seen to send.
     fn parity_cases() -> Vec<(String, &'static str)> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/program-status.jsonl");
-        let captured = std::fs::read_to_string(path).unwrap();
+        let captured = include_str!("../testdata/program-status.jsonl");
         let expected = [
             "float",  // root blocked
             "sink",   // root cleared: ids [""]
@@ -146,8 +146,7 @@ mod tests {
             "sink",   // program exited: ids [""], reason child_exited
             "sink",   // block closed
         ];
-        let captured: Vec<_> = captured.lines().map(str::to_owned).collect();
-        assert_eq!(captured.len(), expected.len());
+        assert_eq!(captured.lines().count(), expected.len());
         let status = |name: &str, payload: &str| {
             format!(
                 r#"{{"type":"session_event","payload":{{"session_id":"session:test","event":{{"type":"block_event","payload":{{"block_id":"block:w1","name":"{name}","payload":{payload}}}}}}}}}"#
@@ -179,7 +178,8 @@ mod tests {
             ),
         ];
         captured
-            .into_iter()
+            .lines()
+            .map(str::to_owned)
             .zip(expected)
             .chain(defensive)
             .collect()
@@ -189,7 +189,7 @@ mod tests {
     /// acts only on the root record (id ""), and a removal sinks the block
     /// only if it names the root.
     fn watcher_action(line: &str) -> &'static str {
-        match crate::events::parse(line) {
+        match events::parse(line) {
             Some(Event::Status { id, record, .. }) if id.is_empty() => {
                 if record.state == "blocked" {
                     "float"
@@ -202,8 +202,6 @@ mod tests {
             _ => "ignore",
         }
     }
-
-    use crate::events::Event;
 
     #[test]
     fn events_rs_and_the_watcher_agree_on_status_events() {
@@ -265,7 +263,8 @@ real_print("PARITY " .. rex.json.encode(out))
 "#,
             script = script(Notify::None),
         );
-        let out = Command::new("rex")
+        let out = crate::rex::Cli::new()
+            .command()
             .args(["do", "-e", &lua])
             .output()
             .unwrap();
@@ -280,9 +279,9 @@ real_print("PARITY " .. rex.json.encode(out))
             .find_map(|l| l.strip_prefix("PARITY "))
             .unwrap_or_else(|| panic!("no result in {stdout}"));
         let got: Vec<String> = serde_json::from_str(got).unwrap();
+        assert_eq!(got.len(), cases.len());
         for ((line, want), got) in cases.iter().zip(&got) {
             assert_eq!(got, want, "{line}");
         }
-        assert_eq!(got.len(), cases.len());
     }
 }
