@@ -30,7 +30,7 @@ use crate::rex::{self, Rex};
 use crate::size;
 
 /// Where a shown worker floats: centred, most of the tab.
-const SHOWN_BOUNDS: [f64; 4] = [0.1, 0.08, 0.8, 0.84];
+pub(crate) const SHOWN_BOUNDS: [f64; 4] = [0.1, 0.08, 0.8, 0.84];
 /// Two clicks on the same worker within this time are a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Resizes allowed for one row count before giving up, so the layer can't bounce.

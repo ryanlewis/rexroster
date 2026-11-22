@@ -130,6 +130,9 @@ pub enum Command {
     /// Print a guide for AI agents: how a lead agent uses rexroster to run
     /// worker sessions. Needs no Rex session.
     Skill,
+    /// Print a Lua snippet that adds rexroster's actions to Rex's command
+    /// palette, for Rex's init.lua to load. Needs no Rex session.
+    Lua,
 }
 
 #[cfg(test)]
