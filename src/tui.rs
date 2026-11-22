@@ -38,9 +38,13 @@ const MAX_FITS: u8 = 4;
 /// A terminal resize this long after our own counts as the user's, and gets fresh attempts.
 const OWN_RESIZE_WINDOW: Duration = Duration::from_secs(2);
 
-/// What [`App::measure`] finds: the layer id, its bounds, and the new height
-/// and new `(x, width)` when they need to change.
-type Measured = (String, [f64; 4], Option<f64>, Option<(f64, f64)>);
+/// What [`App::measure`] finds: the new height and new `(x, width)` when
+/// they need to change.
+type Measured = (Option<f64>, Option<(f64, f64)>);
+/// The reset control, shown while the roster has been dragged.
+const RESET: &str = "↺ reset";
+/// The reset control where there is little room.
+const RESET_SHORT: &str = "↺";
 
 /// Key hints, shown on the last line while the roster has focus.
 pub const FOOTER: &str = "⏎ show · v view · o options · l lead · q quit";
@@ -132,6 +136,21 @@ struct App<'a> {
     guard: pin::Guard,
     /// The open lock, held from deciding to exit until the roster has left.
     leaving: Option<Lock>,
+    follow: Follow,
+    /// Where the reset control was drawn; empty while it isn't shown.
+    reset_area: Rect,
+}
+
+/// Following the lead's pane: the layer's top right corner goes to the top
+/// right of the lead's pane whenever the layout changes, until the user
+/// moves that corner.
+#[derive(Default)]
+struct Follow {
+    /// The user moved the layer, so it stays where they put it.
+    dragged: bool,
+    /// The bounds the roster last gave the layer, or found it at first, to
+    /// tell its own moves from the user's.
+    set: Option<[f64; 4]>,
 }
 
 /// What `rexroster` starts the TUI with.
@@ -209,6 +228,8 @@ struct Fit {
     /// used so far, and when to try again.
     retries: u32,
     retry_at: Option<Instant>,
+    /// A fresh view to place the layer by: the layout may have changed.
+    place: bool,
 }
 
 pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
@@ -243,6 +264,8 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         pin: settings.pin,
         guard: pin::Guard::default(),
         leaving: None,
+        follow: Follow::default(),
+        reset_area: Rect::default(),
     };
     let result = app
         .model
@@ -405,6 +428,7 @@ impl App<'_> {
                 .and_then(|view| {
                     let hidden = self.hide_minimized(&view);
                     self.view = Some(view);
+                    self.fit.place = true;
                     hidden
                 });
         }
@@ -441,6 +465,7 @@ impl App<'_> {
                 dirty: true,
                 want,
                 last_resize: self.fit.last_resize,
+                place: self.fit.place,
                 ..Fit::default()
             };
         }
@@ -453,7 +478,7 @@ impl App<'_> {
             self.fit.retry_at = None;
             self.fit.dirty = true;
         }
-        if self.fit.dirty {
+        if self.fit.dirty || self.fit.place {
             self.fit_layer();
         }
         self.view = None;
@@ -461,10 +486,12 @@ impl App<'_> {
 
     /// Resize the layer towards the wanted rows, at most `MAX_FITS` times per
     /// row count. Until the pane has been drawn it can't be measured, so it
-    /// tries again later, backing off, for up to `size::RETRY_TOTAL`.
+    /// tries again later, backing off, for up to `size::RETRY_TOTAL`. In the
+    /// same call, move it to the lead's pane while it follows the lead.
     fn fit_layer(&mut self) {
-        self.fit.dirty = false;
-        if self.fit.attempts >= MAX_FITS {
+        let sizing = std::mem::take(&mut self.fit.dirty) && self.fit.attempts < MAX_FITS;
+        let placing = std::mem::take(&mut self.fit.place);
+        if !sizing && !placing {
             return;
         }
         let Some(me) = self.model.me.clone() else {
@@ -477,40 +504,97 @@ impl App<'_> {
                 .call("session.view", json!({ "session_id": self.session }))
                 .ok(),
         };
-        let Some((layer, bounds, height, width)) = view.and_then(|v| self.measure(&me, &v)) else {
-            if let Some(delay) = size::retry_delay(self.fit.retries) {
-                self.fit.retries += 1;
-                self.fit.retry_at = Some(Instant::now() + delay);
+        let found = view
+            .as_ref()
+            .and_then(|v| Some((v, rex::floating_layer_of(v, &me)?)));
+        let Some((view, (layer, bounds))) = found else {
+            if sizing {
+                self.retry_fit();
             }
             return;
         };
-        self.fit.retries = 0;
-        self.fit.retry_at = None;
-        if height.is_none() && width.is_none() {
+        let mut target = bounds;
+        let mut sized = false;
+        if sizing {
+            match self.measure(&me, view, bounds) {
+                Some((height, width)) => {
+                    self.fit.retries = 0;
+                    self.fit.retry_at = None;
+                    sized = height.is_some() || width.is_some();
+                    if let Some((x, w)) = width {
+                        (target[0], target[2]) = (x, w);
+                    }
+                    if let Some(h) = height {
+                        target[3] = h;
+                    }
+                }
+                None => self.retry_fit(),
+            }
+        }
+        self.place(view, &me, bounds, &mut target);
+        if !sized && target == bounds {
             return;
         }
-        let [x, y, w, h] = bounds;
-        let (x, w) = width.unwrap_or((x, w));
-        let new_h = height.unwrap_or(h);
-        self.fit.attempts += 1;
+        if sized {
+            self.fit.attempts += 1;
+        }
         self.fit.last_resize = Some(Instant::now());
         let res = self.rex.call(
             "session.resize_layer",
             json!({
                 "session_id": self.session,
                 "layer_id": layer,
-                "bounds": [x, y, w, new_h],
+                "bounds": target,
             }),
         );
-        if let Err(err) = res {
-            self.error = Some(format!("{err:#}"));
+        match res {
+            Ok(_) => self.follow.set = Some(target),
+            Err(err) => self.error = Some(format!("{err:#}")),
         }
     }
 
-    /// The roster's layer in `view`, its bounds and, if it doesn't fit, the
-    /// height and the left edge and width it should have.
-    fn measure(&mut self, me: &str, view: &Value) -> Option<Measured> {
-        let (layer, bounds) = rex::floating_layer_of(view, me)?;
+    /// Measuring failed: try again later, while retries are left.
+    fn retry_fit(&mut self) {
+        if let Some(delay) = size::retry_delay(self.fit.retries) {
+            self.fit.retries += 1;
+            self.fit.retry_at = Some(Instant::now() + delay);
+        }
+    }
+
+    /// Move `target`'s top right corner to the lead pane's, unless the user
+    /// has moved the layer since the roster last did, or the lead isn't a
+    /// tiled pane in the roster's window. A corner somewhere the roster didn't
+    /// put it means the user moved the layer: from then on it stays.
+    fn place(&mut self, view: &Value, me: &str, bounds: [f64; 4], target: &mut [f64; 4]) {
+        // Until the roster moves it, where it is now is where it was put.
+        let set = *self.follow.set.get_or_insert(bounds);
+        if size::corner_moved(set, bounds) {
+            self.follow.dragged = true;
+        }
+        if self.follow.dragged {
+            return;
+        }
+        let Some((window, area)) = rex::tiled_area_of(view, &self.model.lead) else {
+            return;
+        };
+        if rex::window_of(view, me).as_deref() != Some(window.as_str()) {
+            return;
+        }
+        let (x, y) = size::corner_place(area, target[2], target[3]);
+        if (x - target[0]).abs() > 1e-6 || (y - target[1]).abs() > 1e-6 {
+            (target[0], target[1]) = (x, y);
+        }
+    }
+
+    /// Follow the lead's pane again, moving back to it now.
+    fn reset_follow(&mut self) {
+        self.follow = Follow::default();
+        self.fit.place = true;
+    }
+
+    /// If the layer doesn't fit, the height and the left edge and width it
+    /// should have. `None` when the panes can't be measured yet.
+    fn measure(&mut self, me: &str, view: &Value, bounds: [f64; 4]) -> Option<Measured> {
         let lead = &self.model.lead;
         let lead_h = rex::rect_height_of(view, lead)?;
         let lead_size = self.rex.block_call(&self.session, lead, "size").ok()?;
@@ -534,7 +618,7 @@ impl App<'_> {
                 rex::rect_width_of(view, lead)? / f64::from(rex::drawn_columns(&lead_size)?);
             size::new_width(rex::drawn_columns(&my_size)?, per_col, bounds[0], bounds[2])
         })();
-        Some((layer, bounds, new_h, new_w))
+        Some((new_h, new_w))
     }
 
     fn selected_index(&self, rows: &[Row]) -> Option<usize> {
@@ -573,6 +657,7 @@ impl App<'_> {
                         }
                     }
                     KeyCode::Char('l') => self.focus_lead(),
+                    KeyCode::Char('r') => self.reset_follow(),
                     KeyCode::Char('v') => {
                         self.opts.view = match self.opts.view {
                             View::Compact => View::Expanded,
@@ -582,6 +667,12 @@ impl App<'_> {
                     KeyCode::Char('o') => self.panel = Some(Panel::new(self.opts)),
                     _ => {}
                 }
+            }
+            TermEvent::Mouse(m)
+                if m.kind == MouseEventKind::Down(MouseButton::Left)
+                    && self.reset_area.contains((m.column, m.row).into()) =>
+            {
+                self.reset_follow();
             }
             TermEvent::Mouse(m)
                 if m.kind == MouseEventKind::Down(MouseButton::Left) && self.panel.is_some() =>
@@ -723,6 +814,13 @@ impl App<'_> {
         let area = f.area();
         let chrome = 2 * u16::from(self.opts.border == Border::Rounded);
         let footer = self.footer_line(usize::from(area.width.saturating_sub(chrome)));
+        // While dragged, the top right shows a control to follow the lead again.
+        let reset =
+            self.follow
+                .dragged
+                .then_some(if area.width >= 40 { RESET } else { RESET_SHORT });
+        let gray = Style::new().fg(Color::Gray);
+        self.reset_area = Rect::default();
         let inner = match self.opts.border {
             Border::None => area,
             Border::Rounded => {
@@ -734,9 +832,14 @@ impl App<'_> {
                 let mut block = Block::bordered()
                     .border_type(BorderType::Rounded)
                     .border_style(Style::new().fg(Color::DarkGray))
-                    .title(Line::styled(title, Style::new().fg(Color::Gray)));
+                    .title(Line::styled(title, gray));
                 if self.footer_shown() {
                     block = block.title_bottom(footer.clone());
+                }
+                if let Some(reset) = reset {
+                    let w = u16::try_from(reset.width()).unwrap_or(0) + 2;
+                    block = block.title(Line::styled(format!(" {reset} "), gray).right_aligned());
+                    self.reset_area = right_end(area, w, 1);
                 }
                 let inner = block.inner(area);
                 f.render_widget(block, area);
@@ -750,6 +853,13 @@ impl App<'_> {
             let footer =
                 (self.opts.border == Border::None && self.footer_shown()).then_some(footer);
             self.draw_list(f, inner, rows, footer);
+        }
+        if self.opts.border == Border::None
+            && let Some(reset) = reset
+        {
+            let w = u16::try_from(reset.width()).unwrap_or(0);
+            self.reset_area = right_end(area, w, 0);
+            f.render_widget(Line::styled(reset, gray), self.reset_area);
         }
     }
 
@@ -851,6 +961,20 @@ impl App<'_> {
             };
             f.render_widget(Paragraph::new(line), at);
         }
+    }
+}
+
+/// The last `w` columns of `area`'s top line, `gap` columns in from its
+/// right edge. Empty when they don't fit.
+fn right_end(area: Rect, w: u16, gap: u16) -> Rect {
+    if area.height == 0 || w + gap > area.width {
+        return Rect::default();
+    }
+    Rect {
+        x: area.right() - gap - w,
+        y: area.y,
+        width: w,
+        height: 1,
     }
 }
 
@@ -1146,6 +1270,8 @@ mod tests {
             pin: crate::lock::temp_dir("tui-pin").join("pin"),
             guard: pin::Guard::default(),
             leaving: None,
+            follow: Follow::default(),
+            reset_area: Rect::default(),
         }
     }
 
@@ -1790,6 +1916,215 @@ mod tests {
             rex.params("session.resize_layer").len(),
             usize::from(MAX_FITS)
         );
+    }
+
+    /// A view with the lead tiled at `lead` and the roster floating at `roster`.
+    fn laid_out(lead: [f64; 4], roster: [f64; 4]) -> Value {
+        json!({"windows": [{"window_id": "window:1", "layers": [
+            {"layer_id": "layer:tiled", "kind": "tiled", "bounds": [0, 0, 1, 1],
+             "layout": {"rect": [0, 0, 1, 1], "children": [
+                {"rect": lead, "block_id": "block:lead"},
+                {"rect": [0.5, 0, 0.5, 1], "block_id": "block:other"}]},
+             "blocks": [{"block_id": "block:lead"}, {"block_id": "block:other"}]},
+            {"layer_id": "layer:float", "kind": "floating", "bounds": roster,
+             "layout": {"rect": roster, "block_id": "block:roster"},
+             "blocks": [{"block_id": "block:roster"}]}
+        ]}]})
+    }
+
+    const START: [f64; 4] = [0.72, 0.02, 0.27, 0.12];
+    const FULL: [f64; 4] = [0.0, 0.0, 1.0, 1.0];
+    const LEFT_HALF: [f64; 4] = [0.0, 0.0, 0.5, 1.0];
+
+    /// A roster whose lead fills the window, and the roster in its corner.
+    fn following(rex: &Fake) -> App<'_> {
+        rex.on("session.view", laid_out(FULL, START));
+        let mut a = app(rex);
+        a.model.me = Some("block:roster".into());
+        view_pass(&mut a);
+        assert!(rex.params("session.resize_layer").is_empty());
+        a
+    }
+
+    /// What a `session_view_changed` event leads to: a fresh view, then a fit.
+    fn view_pass(a: &mut App) {
+        a.sync(Needs {
+            view: true,
+            blocks: false,
+        });
+        a.fit_if_due();
+    }
+
+    /// The bounds of the `n`th `session.resize_layer` call.
+    fn resized(rex: &Fake, n: usize) -> [f64; 4] {
+        let p = &rex.params("session.resize_layer")[n];
+        let b: Vec<f64> = p["bounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        [b[0], b[1], b[2], b[3]]
+    }
+
+    fn close(a: [f64; 4], b: [f64; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9)
+    }
+
+    #[test]
+    fn follows_the_lead_when_it_splits() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        // The lead splits: it now has the left half of the window.
+        rex.on("session.view", laid_out(LEFT_HALF, START));
+        view_pass(&mut a);
+        let moved = resized(&rex, 0);
+        assert!(close(moved, [0.22, 0.02, 0.27, 0.12]), "{moved:?}");
+        assert_eq!(
+            rex.params("session.resize_layer")[0]["layer_id"],
+            "layer:float"
+        );
+        // Its own move coming back in the view isn't taken for a drag.
+        rex.on("session.view", laid_out(LEFT_HALF, moved));
+        view_pass(&mut a);
+        assert!(!a.follow.dragged);
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        // The other pane closes: back to the window's corner.
+        rex.on("session.view", laid_out(FULL, moved));
+        view_pass(&mut a);
+        assert!(close(resized(&rex, 1), START), "{:?}", resized(&rex, 1));
+    }
+
+    #[test]
+    fn stays_where_it_was_dragged() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        let dropped = [0.3, 0.4, 0.27, 0.12];
+        rex.on("session.view", laid_out(FULL, dropped));
+        view_pass(&mut a);
+        assert!(a.follow.dragged);
+        rex.on("session.view", laid_out(LEFT_HALF, dropped));
+        view_pass(&mut a);
+        assert!(rex.params("session.resize_layer").is_empty());
+    }
+
+    #[test]
+    fn a_resize_that_keeps_the_corner_is_not_a_drag() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        // Pulled out from the bottom left corner: the top right stays.
+        rex.on("session.view", laid_out(FULL, [0.5, 0.02, 0.49, 0.3]));
+        view_pass(&mut a);
+        assert!(!a.follow.dragged);
+        rex.on("session.view", laid_out(LEFT_HALF, [0.5, 0.02, 0.49, 0.3]));
+        view_pass(&mut a);
+        let moved = resized(&rex, 0);
+        assert!(close(moved, [0.0, 0.02, 0.49, 0.3]), "{moved:?}");
+    }
+
+    #[test]
+    fn does_not_move_unless_the_lead_is_tiled_in_its_window() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        // The lead floats.
+        let mut v = laid_out(LEFT_HALF, START);
+        let tiled = &mut v["windows"][0]["layers"][0];
+        tiled["layout"]["children"][0]["block_id"] = json!("block:x");
+        tiled["blocks"][0]["block_id"] = json!("block:x");
+        v["windows"][0]["layers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(
+                {"layer_id": "layer:lead", "kind": "floating", "bounds": [0.1, 0.1, 0.3, 0.3],
+                 "layout": {"rect": [0.1, 0.1, 0.3, 0.3], "block_id": "block:lead"},
+                 "blocks": [{"block_id": "block:lead"}]}
+            ));
+        rex.on("session.view", v);
+        view_pass(&mut a);
+        // The lead is tiled, but in another window.
+        let mut v = laid_out(LEFT_HALF, START);
+        let float = v["windows"][0]["layers"][1].take();
+        v["windows"][0]["layers"].as_array_mut().unwrap().pop();
+        v["windows"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"window_id": "window:2", "layers": [float]}));
+        rex.on("session.view", v);
+        view_pass(&mut a);
+        // Another pane is zoomed over the lead.
+        let mut v = laid_out(LEFT_HALF, START);
+        v["windows"][0]["zoomed_block_id"] = json!("block:other");
+        rex.on("session.view", v);
+        view_pass(&mut a);
+        assert!(rex.params("session.resize_layer").is_empty());
+        assert!(!a.follow.dragged);
+    }
+
+    #[test]
+    fn r_puts_a_dragged_roster_back_and_it_follows_again() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        let dropped = [0.3, 0.4, 0.27, 0.12];
+        rex.on("session.view", laid_out(FULL, dropped));
+        view_pass(&mut a);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('r').into()), &[]);
+        a.fit_if_due();
+        assert!(close(resized(&rex, 0), START), "{:?}", resized(&rex, 0));
+        assert!(!a.follow.dragged);
+        rex.on("session.view", laid_out(FULL, START));
+        view_pass(&mut a);
+        rex.on("session.view", laid_out(LEFT_HALF, START));
+        view_pass(&mut a);
+        let moved = resized(&rex, 1);
+        assert!(close(moved, [0.22, 0.02, 0.27, 0.12]), "{moved:?}");
+    }
+
+    #[test]
+    fn r_does_nothing_while_following() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('r').into()), &[]);
+        a.fit_if_due();
+        assert!(rex.params("session.resize_layer").is_empty());
+    }
+
+    #[test]
+    fn the_reset_control_shows_while_dragged_and_a_click_puts_it_back() {
+        for border in [Border::None, Border::Rounded] {
+            let rex = Fake::default();
+            let mut a = following(&rex);
+            a.opts.border = border;
+            let rows = [row("block:1", "a", "idle", false)];
+            let screen = render(&mut a, &rows);
+            assert!(!screen.contains('↺'), "{screen}");
+            rex.on("session.view", laid_out(FULL, [0.3, 0.4, 0.27, 0.12]));
+            view_pass(&mut a);
+            let screen = render(&mut a, &rows);
+            let top = screen.lines().next().unwrap();
+            let reset_at = if border == Border::None { 45 } else { 43 };
+            assert_eq!(
+                top.chars()
+                    .skip(reset_at)
+                    .collect::<String>()
+                    .trim_end_matches(['╮', ' ']),
+                "↺ reset",
+                "{screen}"
+            );
+            let click = TermEvent::Mouse(ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 47,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            a.on_terminal_event(&click, &rows);
+            // The click doesn't select or show a worker.
+            assert_eq!(a.selected, None);
+            assert!(a.last_click.is_none());
+            a.fit_if_due();
+            assert!(close(resized(&rex, 0), START), "{:?}", resized(&rex, 0));
+            let screen = render(&mut a, &rows);
+            assert!(!screen.contains('↺'), "{screen}");
+        }
     }
 
     #[test]

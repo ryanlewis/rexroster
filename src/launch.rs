@@ -9,8 +9,10 @@ use serde_json::{Value, json};
 use crate::lock::Lock;
 use crate::pin;
 use crate::rex::{self, Rex, SHELL_FLAVOR};
+use crate::size;
 
-/// Where the roster opens: top right of the lead's tab.
+/// Where the roster opens when the lead isn't a tiled pane: top right of the
+/// lead's tab. Over a tiled lead it opens this size at the pane's top right.
 pub const ROSTER_BOUNDS: [f64; 4] = [0.72, 0.02, 0.27, 0.12];
 
 /// The roster's block label: `roster-` and the last 6 characters of the lead's id.
@@ -73,6 +75,14 @@ fn open_locked(
     let view = rex.call("session.view", json!({ "session_id": session }))?;
     let window = rex::window_of(&view, lead)
         .with_context(|| format!("lead {lead} is not in a window of this session"))?;
+    let bounds = match rex::tiled_area_of(&view, lead) {
+        Some((w, area)) if w == window => {
+            let [_, _, width, height] = ROSTER_BOUNDS;
+            let (x, y) = size::corner_place(area, width, height);
+            [x, y, width, height]
+        }
+        _ => ROSTER_BOUNDS,
+    };
     let pin = pin::path(lock_dir, session, lead);
     let mut command = vec![
         utf8(exe.as_os_str())?,
@@ -87,7 +97,7 @@ fn open_locked(
         json!({
             "session_id": session,
             "window_id": window,
-            "bounds": ROSTER_BOUNDS,
+            "bounds": bounds,
             "focus": false,
             "layout": { "block": {
                 "flavor": SHELL_FLAVOR,
@@ -264,6 +274,37 @@ mod tests {
         json!({"windows": [{"window_id": "window:w", "layers": [
             {"layer_id": "layer:t", "kind": "tiled", "blocks": [{"block_id": LEAD}]}
         ]}]})
+    }
+
+    #[test]
+    fn open_places_the_roster_at_the_top_right_of_a_tiled_lead() {
+        let dir = locks();
+        let rex = Fake::default();
+        rex.on("session.list_blocks", json!({"blocks": []}));
+        rex.on(
+            "session.view",
+            json!({"windows": [{"window_id": "window:w", "layers": [
+                {"layer_id": "layer:t", "kind": "tiled",
+                 "layout": {"rect": [0, 0, 1, 1], "children": [
+                    {"rect": [0, 0, 0.5, 1], "block_id": LEAD},
+                    {"rect": [0.5, 0, 0.5, 1], "block_id": "block:b"}]},
+                 "blocks": [{"block_id": LEAD}, {"block_id": "block:b"}]}
+            ]}]}),
+        );
+        rex.on("session.new_layer", json!({"layer_id": "layer:new"}));
+        open(&rex, "s", LEAD, Path::new("/bin/rexroster"), &[], &dir).unwrap();
+        let b = &rex.params("session.new_layer")[0]["bounds"];
+        let b: Vec<f64> = b
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let want = [0.22, 0.02, 0.27, 0.12];
+        assert!(
+            b.iter().zip(want).all(|(x, y)| (x - y).abs() < 1e-9),
+            "{b:?}"
+        );
     }
 
     #[test]

@@ -150,6 +150,29 @@ pub fn new_width(cols: u16, per_col: f64, x: f64, w: f64) -> Option<(f64, f64)> 
     ((target - w).abs() > 1e-6).then_some((right - target, target))
 }
 
+/// The gap the roster keeps from the right and top edges of the lead's pane,
+/// as window fractions.
+pub const INSET_RIGHT: f64 = 0.01;
+pub const INSET_TOP: f64 = 0.02;
+
+/// Where a layer `w` wide and `h` tall goes so its top right corner sits
+/// just inside the top right of `area` (`[x, y, w, h]`, window fractions):
+/// its new left and top edges. It keeps its size, and stays inside the
+/// window, so over a pane narrower than itself it reaches out to the left.
+pub fn corner_place(area: [f64; 4], w: f64, h: f64) -> (f64, f64) {
+    let right = (area[0] + area[2] - INSET_RIGHT).min(1.0);
+    let top = area[1] + INSET_TOP;
+    ((right - w).max(0.0), top.min(1.0 - h).max(0.0))
+}
+
+/// Whether the top right corner of `now` differs from that of `then`, both
+/// `[x, y, w, h]`. Fitting the height or widening to the left keeps the
+/// corner, so only a move, or a resize from that corner, changes it.
+pub fn corner_moved(then: [f64; 4], now: [f64; 4]) -> bool {
+    const EPS: f64 = 1e-4;
+    ((then[0] + then[2]) - (now[0] + now[2])).abs() > EPS || (then[1] - now[1]).abs() > EPS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +354,27 @@ mod tests {
         // A layer moved low, y = 0.97, wants to shrink.
         let h = new_height(2, 10, PER, 0.97, 0.03);
         assert!(h.is_none_or(|h| 0.97 + h <= 1.0 + 1e-9), "{h:?}");
+    }
+
+    #[test]
+    fn places_the_corner_inside_the_area() {
+        let (x, y) = corner_place([0.5, 0.5, 0.5, 0.5], 0.27, 0.12);
+        assert!(
+            (x - 0.72).abs() < 1e-9 && (y - 0.52).abs() < 1e-9,
+            "{x} {y}"
+        );
+        // A pane narrower than the layer: it reaches out to the left.
+        let (x, _) = corner_place([0.8, 0.0, 0.2, 1.0], 0.5, 0.12);
+        assert!((x - 0.49).abs() < 1e-9, "{x}");
+        // Kept inside the window on the left and at the bottom.
+        assert_eq!(corner_place([0.0, 0.95, 0.3, 0.05], 0.5, 0.12), (0.0, 0.88));
+    }
+
+    #[test]
+    fn only_a_moved_corner_counts() {
+        let then = [0.72, 0.02, 0.27, 0.12];
+        assert!(!corner_moved(then, [0.62, 0.02, 0.37, 0.3]));
+        assert!(corner_moved(then, [0.5, 0.02, 0.27, 0.12]));
+        assert!(corner_moved(then, [0.72, 0.3, 0.27, 0.12]));
     }
 }

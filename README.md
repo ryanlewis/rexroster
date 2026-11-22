@@ -43,7 +43,7 @@ Every command except `watch` and `skill` reads the session from `$REX_SESSION` a
 | Command | What it does |
 | --- | --- |
 | `rexroster [--lead <block-id>] [--border none\|rounded] [--view compact\|expanded]` | Runs the roster for a lead. `--lead` defaults to `$REXROSTER_LEAD`. `--border` and `--view` override the config file for this run. |
-| `rexroster open <lead-block-id> [--border …] [--view …]` | Opens the lead's roster in a floating layer at the top right of the lead's tab, without focus, unless a block labelled `roster-<last 6 characters of the lead id>` already exists. Prints the new layer id, or nothing. Exits 0 in both cases. Passes `--border` and `--view` on to the roster. Then starts the watcher, if the config's `watch` is on and no watcher is running. |
+| `rexroster open <lead-block-id> [--border …] [--view …]` | Opens the lead's roster in a floating layer at the top right of the lead's pane, without focus, unless a block labelled `roster-<last 6 characters of the lead id>` already exists. Prints the new layer id, or nothing. Exits 0 in both cases. Passes `--border` and `--view` on to the roster. Then starts the watcher, if the config's `watch` is on and no watcher is running. |
 | `rexroster spawn <lead-block-id> <name> [--task <text>] [--cwd <dir>] -- <cmd> [args...]` | Starts a detached block labelled `<name>` that runs `rexroster tag <lead> [--task <text>] -- <cmd...>`, then does what `open` does. Prints `{"block_id":"…","roster_layer_id":"…"}`, where `roster_layer_id` is `null` if the roster was already open. |
 | `rexroster pin <lead-block-id> [<label>]` | Pins the session's name for the lead's run (see [The session name](#the-session-name)). With `<label>`, pins it and renames the session to it; without, pins the current name. Prints the pinned name. |
 | `rexroster tag <lead-block-id> [--task <text>] -- <cmd> [args...]` | Marks the terminal as the lead's worker, then replaces itself with `<cmd>`. |
@@ -89,11 +89,14 @@ Press `v` for the expanded view. Each worker then has a line with its label and 
 | `v` | Switch between the compact and expanded views (not saved) |
 | `o` | Open the options panel |
 | `l` | Focus the lead |
+| `r`, click `↺ reset` | Move the roster back to the lead's pane and follow it again, after you have dragged it |
 | `q`, `Ctrl-C` | Quit |
 
 A line of key hints shows at the bottom while the roster has focus. With a border, the hints sit on the bottom border instead.
 
 To hide a shown worker, press `Enter` on it or minimize its pane: the roster turns a minimized worker back into a hidden one. Closing a worker's pane ends the worker.
+
+The roster's layer sits at the top right of the lead's pane, and moves with it when the layout changes: a split forms, a pane closes or is resized. When the lead is zoomed, the roster sits at the top right of the window. When the lead floats, is in another window, or has another pane zoomed over it, the roster stays where it is. Once you drag the roster somewhere else, it stays there and shows `↺ reset` at its top right; click it or press `r` to send it back. Resizing the roster from any corner but its top right doesn't count as a drag.
 
 The layer's height follows the lines the workers take, plus the hints line while focused, up to 60% of the window's height. If the roster's pane is narrower than 50 columns, the roster widens it to 50, growing to the left so it stays in the corner. It never narrows a pane you have widened. If the roster never gets a worker, it exits after 30 seconds.
 
