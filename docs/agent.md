@@ -129,6 +129,11 @@ rexroster pin "$REX_BLOCK"                # keep the session's current name
 Without `pin`, a rename during a run is reverted. After 5 reverts in a minute
 the roster stops reverting for a while and shows why.
 
+The user may have rexroster's palette actions loaded (`rexroster lua` prints
+them, for Rex's init.lua): "Roster: Rename session…" renames through the pin,
+and "Roster: Show worker…" shows one of your workers. You don't need them;
+use `rexroster pin` and the commands above.
+
 ## The watcher
 
 `rexroster watch` runs in the background, one per user per Rex server; `spawn`

@@ -4,6 +4,7 @@ mod events;
 mod launch;
 mod lock;
 mod model;
+mod palette;
 mod pin;
 mod rex;
 mod size;
@@ -32,9 +33,18 @@ fn main() -> ExitCode {
 const AGENT_GUIDE: &str = include_str!("../docs/agent.md");
 
 fn run(cli: Cli) -> Result<()> {
-    if let Some(Command::Skill) = cli.command {
-        print!("{AGENT_GUIDE}");
-        return Ok(());
+    // These print and need no Rex session, nor the display flags.
+    match cli.command {
+        Some(Command::Skill) => {
+            print!("{AGENT_GUIDE}");
+            return Ok(());
+        }
+        Some(Command::Lua) => {
+            let exe = std::env::current_exe().ok();
+            print!("{}", palette::script(exe.as_deref()));
+            return Ok(());
+        }
+        _ => {}
     }
     let display = cli.subcommand_display()?;
     if let Some(Command::Watch) = cli.command {
@@ -136,7 +146,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Watch | Command::Skill) => unreachable!("handled above"),
+        Some(Command::Watch | Command::Skill | Command::Lua) => unreachable!("handled above"),
     }
 }
 
