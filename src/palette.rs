@@ -18,14 +18,18 @@ pub fn script(exe: Option<&Path>) -> String {
 }
 
 /// The first executable file named `rexroster` in the absolute directories of
-/// `path` (a `PATH` value), as `PATH` spelled it. Symlinks are not resolved, so a
-/// version manager's shim stays the shim and survives upgrades.
-pub fn find_on_path(path: Option<&OsStr>) -> Option<PathBuf> {
+/// `path` (a `PATH` value) that is the same file as `exe`, as `PATH` spelled it.
+/// Symlinks are compared by where they lead but not resolved in the result, so
+/// a stable link (Homebrew's, say) survives upgrades. A version manager's shim
+/// leads to the manager's own binary and an older install is another file, so
+/// neither matches.
+pub fn find_on_path(path: Option<&OsStr>, exe: &Path) -> Option<PathBuf> {
+    let exe = exe.canonicalize().ok()?;
     std::env::split_paths(path?)
         // A relative or empty entry would mean Rex's directory, not ours.
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("rexroster"))
-        .find(|p| is_executable(p))
+        .find(|p| is_executable(p) && p.canonicalize().is_ok_and(|c| c == exe))
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -270,23 +274,80 @@ rex = setmetatable({{
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// A `rexroster` file in a new directory `name` under `dir`.
+    fn install(dir: &Path, name: &str) -> PathBuf {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        executable(&d.join("rexroster"), 0o755);
+        d.join("rexroster")
+    }
+
+    fn paths(dirs: &[&Path]) -> std::ffi::OsString {
+        std::env::join_paths(dirs).unwrap()
+    }
+
     #[test]
-    fn the_first_executable_on_path_wins() {
-        let dir = crate::lock::temp_dir("palette-path");
-        let (a, b, c) = (dir.join("a"), dir.join("b"), dir.join("c"));
-        for d in [&a, &b, &c] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        // `a` has a file that isn't executable, `b` a directory by that name.
-        executable(&a.join("rexroster"), 0o644);
-        std::fs::create_dir_all(b.join("rexroster")).unwrap();
-        executable(&c.join("rexroster"), 0o755);
-        let path = std::env::join_paths([&a, &b, &dir.join("missing"), &c]).unwrap();
-        assert_eq!(find_on_path(Some(&path)), Some(c.join("rexroster")));
-        // None executable, or no PATH: nothing, so the caller falls back.
-        let path = std::env::join_paths([&a, &b]).unwrap();
-        assert_eq!(find_on_path(Some(&path)), None);
-        assert_eq!(find_on_path(None), None);
+    fn the_exe_itself_on_path_is_used() {
+        let dir = crate::lock::temp_dir("palette-path-exe");
+        let exe = install(&dir, "bin");
+        let path = paths(&[&dir.join("missing"), &dir.join("bin")]);
+        assert_eq!(find_on_path(Some(&path), &exe), Some(exe));
+    }
+
+    #[test]
+    fn a_non_executable_or_directory_match_is_skipped() {
+        let dir = crate::lock::temp_dir("palette-path-kinds");
+        let exe = install(&dir, "bin");
+        std::fs::create_dir_all(dir.join("a/rexroster")).unwrap();
+        executable(&exe, 0o644);
+        let path = paths(&[&dir.join("a"), &dir.join("bin")]);
+        assert_eq!(find_on_path(Some(&path), &exe), None);
+    }
+
+    #[test]
+    fn a_symlink_that_resolves_to_the_exe_is_used_as_written() {
+        let dir = crate::lock::temp_dir("palette-path-link");
+        let exe = install(&dir, "Cellar/1.0");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&exe, dir.join("bin/rexroster")).unwrap();
+        let path = paths(&[&dir.join("bin")]);
+        assert_eq!(
+            find_on_path(Some(&path), &exe),
+            Some(dir.join("bin/rexroster"))
+        );
+    }
+
+    #[test]
+    fn a_shim_that_leads_elsewhere_is_skipped() {
+        let dir = crate::lock::temp_dir("palette-path-shim");
+        let exe = install(&dir, "cargo");
+        let mise = install(&dir, "mise");
+        std::fs::create_dir_all(dir.join("shims")).unwrap();
+        std::os::unix::fs::symlink(&mise, dir.join("shims/rexroster")).unwrap();
+        let path = paths(&[&dir.join("shims")]);
+        assert_eq!(find_on_path(Some(&path), &exe), None);
+    }
+
+    #[test]
+    fn an_older_rexroster_earlier_on_path_is_skipped() {
+        let dir = crate::lock::temp_dir("palette-path-older");
+        install(&dir, "old");
+        let exe = install(&dir, "new");
+        let path = paths(&[&dir.join("old"), &dir.join("new")]);
+        assert_eq!(find_on_path(Some(&path), &exe), Some(exe));
+    }
+
+    #[test]
+    fn no_match_gives_nothing_so_the_caller_falls_back() {
+        let dir = crate::lock::temp_dir("palette-path-none");
+        let exe = install(&dir, "bin");
+        let other = install(&dir, "other");
+        assert_eq!(find_on_path(None, &exe), None);
+        let path = paths(&[other.parent().unwrap()]);
+        assert_eq!(find_on_path(Some(&path), &exe), None);
+        // An exe that can't be resolved matches nothing.
+        let path = paths(&[&dir.join("bin")]);
+        assert_eq!(find_on_path(Some(&path), &dir.join("gone")), None);
     }
 
     #[test]
@@ -295,20 +356,10 @@ rex = setmetatable({{
         let rel = Path::new("target/palette-relative");
         std::fs::create_dir_all(rel).unwrap();
         executable(&rel.join("rexroster"), 0o755);
+        let exe = rel.join("rexroster").canonicalize().unwrap();
         for path in ["target/palette-relative", ":target/palette-relative", ""] {
-            assert_eq!(find_on_path(Some(OsStr::new(path))), None, "{path:?}");
+            assert_eq!(find_on_path(Some(OsStr::new(path)), &exe), None, "{path:?}");
         }
-    }
-
-    #[test]
-    fn a_symlink_on_path_is_not_resolved() {
-        let dir = crate::lock::temp_dir("palette-shim");
-        std::fs::create_dir_all(dir.join("shims")).unwrap();
-        std::fs::create_dir_all(dir.join("v1")).unwrap();
-        executable(&dir.join("v1/rexroster"), 0o755);
-        std::os::unix::fs::symlink(dir.join("v1/rexroster"), dir.join("shims/rexroster")).unwrap();
-        let path = std::env::join_paths([dir.join("shims")]).unwrap();
-        assert_eq!(find_on_path(Some(&path)), Some(dir.join("shims/rexroster")));
     }
 
     /// Runs the loader for a binary that is `body` (a shell script), or is

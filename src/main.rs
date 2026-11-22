@@ -46,9 +46,13 @@ fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         Some(Command::Lua { loader: true }) => {
-            // Prefer the PATH spelling (a shim) over the versioned exe.
-            let exe = palette::find_on_path(std::env::var_os("PATH").as_deref())
-                .or_else(|| std::env::current_exe().ok());
+            // Prefer the PATH spelling of this binary (a stable symlink, say)
+            // over its own path; any other `rexroster` on PATH is not us.
+            let own = std::env::current_exe().ok();
+            let exe = own
+                .as_deref()
+                .and_then(|own| palette::find_on_path(std::env::var_os("PATH").as_deref(), own))
+                .or(own);
             let exe = exe.as_deref().and_then(Path::to_str).unwrap_or("rexroster");
             print!("{}", palette::loader(exe));
             return Ok(());
