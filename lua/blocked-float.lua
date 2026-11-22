@@ -98,5 +98,19 @@ rex.on("terminal.program_status_changed", function(ctx, ev)
   end
 end)
 
-rex.on("terminal.program_status_removed", function(ctx, _) sink(ctx.block_id, false) end)
+-- Only the root record's removal sinks the block. A subagent's record goes
+-- when it finishes, named in `ids`; that says nothing about the prompt still
+-- waiting. A missing or null `ids` is the root, else the listed ids, falling
+-- back to `id`, as src/events.rs reads it.
+local function removes_root(ev)
+  if type(ev.ids) ~= "table" then return type(ev.id) ~= "string" or ev.id == "" end
+  for _, i in ipairs(ev.ids) do
+    if type(i) ~= "string" or i == "" then return true end
+  end
+  return false
+end
+
+rex.on("terminal.program_status_removed", function(ctx, ev)
+  if removes_root(ev) then sink(ctx.block_id, false) end
+end)
 rex.on("block_closed", function(_, ev) sink(ev.block_id, true) end)
