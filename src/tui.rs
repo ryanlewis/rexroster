@@ -597,7 +597,11 @@ impl App<'_> {
     /// should have. `None` when the panes can't be measured yet.
     fn measure(&mut self, me: &str, view: &Value, bounds: [f64; 4]) -> Option<Measured> {
         let lead = &self.model.lead;
-        let lead_h = rex::rect_height_of(view, lead)?;
+        // Zoomed, the lead fills more than its layout cell says.
+        let lead_h = match rex::tiled_area_of(view, lead) {
+            Some((_, area)) => area[3],
+            None => rex::rect_height_of(view, lead)?,
+        };
         let lead_size = self.rex.block_call(&self.session, lead, "size").ok()?;
         let my_size = self.rex.block_call(&self.session, me, "size").ok()?;
         let lead_rows = rex::drawn_rows(&lead_size)?;
@@ -1818,6 +1822,28 @@ mod tests {
         assert_eq!(p["layer_id"], "layer:float");
         // Lead: 0.5 of the window over 25 rows, so 0.02 a row; 2 rows missing.
         let h = p["bounds"][3].as_f64().unwrap();
+        assert!((h - 0.16).abs() < 1e-9, "{h}");
+    }
+
+    #[test]
+    fn fits_to_a_zoomed_lead() {
+        let rex = Fake::default();
+        sized(&rex, 1);
+        let mut v: Value = serde_json::from_str(include_str!("../testdata/view.json")).unwrap();
+        v["windows"][0]["zoomed_block_id"] = json!("block:lead");
+        rex.on("session.view", v);
+        // Zoomed, the lead's 50 rows fill the window: 0.02 a row.
+        rex.on(
+            "block:lead size",
+            json!({"rows": 50, "desired": [{"rows": 50}]}),
+        );
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        a.fit_layer();
+        let h = rex.params("session.resize_layer")[0]["bounds"][3]
+            .as_f64()
+            .unwrap();
         assert!((h - 0.16).abs() < 1e-9, "{h}");
     }
 
