@@ -151,6 +151,9 @@ struct Follow {
     /// The bounds the roster last gave the layer, or found it at first, to
     /// tell its own moves from the user's.
     set: Option<[f64; 4]>,
+    /// One column's and one row's share of the window, once measured, so a
+    /// corner off by less than a cell isn't taken for a drag.
+    cell: [f64; 2],
 }
 
 /// What `rexroster` starts the TUI with.
@@ -569,7 +572,7 @@ impl App<'_> {
     fn place(&mut self, view: &Value, me: &str, bounds: [f64; 4], target: &mut [f64; 4]) {
         // Until the roster moves it, where it is now is where it was put.
         let set = *self.follow.set.get_or_insert(bounds);
-        if size::corner_moved(set, bounds) {
+        if size::corner_moved(set, bounds, self.follow.cell) {
             self.follow.dragged = true;
         }
         if self.follow.dragged {
@@ -589,7 +592,10 @@ impl App<'_> {
 
     /// Follow the lead's pane again, moving back to it now.
     fn reset_follow(&mut self) {
-        self.follow = Follow::default();
+        self.follow = Follow {
+            cell: self.follow.cell,
+            ..Follow::default()
+        };
         self.fit.place = true;
     }
 
@@ -618,11 +624,13 @@ impl App<'_> {
             .observe(bounds[3], rows, lead_h / f64::from(lead_rows));
         let new_h = size::new_height(self.fit.want, rows, per_row, bounds[1], bounds[3]);
         // Older Rex servers may not report columns; then only the height fits.
-        let new_w = (|| {
-            let per_col =
-                rex::rect_width_of(view, lead)? / f64::from(rex::drawn_columns(&lead_size)?);
-            size::new_width(rex::drawn_columns(&my_size)?, per_col, bounds[0], bounds[2])
+        let per_col = (|| {
+            Some(rex::rect_width_of(view, lead)? / f64::from(rex::drawn_columns(&lead_size)?))
         })();
+        self.follow.cell = [per_col.unwrap_or(0.0), per_row];
+        let new_w = per_col.and_then(|per_col| {
+            size::new_width(rex::drawn_columns(&my_size)?, per_col, bounds[0], bounds[2])
+        });
         Some((new_h, new_w))
     }
 
@@ -2085,6 +2093,36 @@ mod tests {
         view_pass(&mut a);
         assert!(rex.params("session.resize_layer").is_empty());
         assert!(!a.follow.dragged);
+    }
+
+    #[test]
+    fn rounding_by_rex_is_not_a_drag() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        // Measured: 100 columns and 50 rows over the window.
+        rex.on(
+            "block:lead size",
+            json!({"rows": 50, "columns": 100, "desired": [{"rows": 50}]}),
+        );
+        rex.on(
+            "block:roster size",
+            json!({"rows": 4, "columns": 30, "desired": [{"rows": 4}]}),
+        );
+        a.note_rows(4);
+        a.fit_if_due();
+        assert!(a.follow.cell[0] > 0.0 && a.follow.cell[1] > 0.0);
+        let [x, y, w, h] = a.follow.set.unwrap();
+        // Rex snaps the corner by a third of a column and of a row.
+        rex.on(
+            "session.view",
+            laid_out(FULL, [x + 0.0033, y + 0.0067, w, h]),
+        );
+        view_pass(&mut a);
+        assert!(!a.follow.dragged);
+        // A drag of one column is still a drag.
+        rex.on("session.view", laid_out(FULL, [x - 0.01, y, w, h]));
+        view_pass(&mut a);
+        assert!(a.follow.dragged);
     }
 
     #[test]

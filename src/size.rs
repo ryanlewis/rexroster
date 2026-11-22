@@ -169,9 +169,24 @@ pub fn corner_place(area: [f64; 4], w: f64, h: f64) -> (f64, f64) {
 /// `[x, y, w, h]`. Fitting the height or widening to the left keeps the
 /// corner, so only a move, or a resize that moves the top or right edge,
 /// changes it.
-pub fn corner_moved(then: [f64; 4], now: [f64; 4]) -> bool {
-    const EPS: f64 = 1e-4;
-    ((then[0] + then[2]) - (now[0] + now[2])).abs() > EPS || (then[1] - now[1]).abs() > EPS
+///
+/// `cell` is one column's and one row's share of the window, `0.0` where
+/// unknown. A corner off by less than 0.4 of a cell is Rex rounding, not a
+/// move: a drag moves whole cells. Not half a cell, as the row height can be
+/// guessed up to twice too high before it is learned. Until a cell is
+/// measured the slack is 0.001, under 0.4 of a column in a window of up to
+/// 400 columns.
+pub fn corner_moved(then: [f64; 4], now: [f64; 4], cell: [f64; 2]) -> bool {
+    const UNKNOWN: f64 = 0.001;
+    let slack = |c: f64| {
+        if c.is_finite() && c > 0.0 {
+            0.4 * c
+        } else {
+            UNKNOWN
+        }
+    };
+    ((then[0] + then[2]) - (now[0] + now[2])).abs() > slack(cell[0])
+        || (then[1] - now[1]).abs() > slack(cell[1])
 }
 
 #[cfg(test)]
@@ -374,8 +389,27 @@ mod tests {
     #[test]
     fn only_a_moved_corner_counts() {
         let then = [0.72, 0.02, 0.27, 0.12];
-        assert!(!corner_moved(then, [0.62, 0.02, 0.37, 0.3]));
-        assert!(corner_moved(then, [0.5, 0.02, 0.27, 0.12]));
-        assert!(corner_moved(then, [0.72, 0.3, 0.27, 0.12]));
+        let none = [0.0; 2];
+        assert!(!corner_moved(then, [0.62, 0.02, 0.37, 0.3], none));
+        assert!(corner_moved(then, [0.5, 0.02, 0.27, 0.12], none));
+        assert!(corner_moved(then, [0.72, 0.3, 0.27, 0.12], none));
+    }
+
+    #[test]
+    fn rounding_within_a_cell_is_not_a_move() {
+        // 200 columns and 50 rows in the window.
+        let cell = [0.005, 0.02];
+        let then = [0.72, 0.02, 0.27, 0.12];
+        // Snapped by a third of a cell either way.
+        assert!(!corner_moved(then, [0.7217, 0.0267, 0.27, 0.12], cell));
+        assert!(!corner_moved(then, [0.7183, 0.0133, 0.27, 0.12], cell));
+        // Dragged by one column, or one row.
+        assert!(corner_moved(then, [0.715, 0.02, 0.27, 0.12], cell));
+        assert!(corner_moved(then, [0.72, 0.04, 0.27, 0.12], cell));
+        // Before a cell is measured: a little rounding is let through, and
+        // a column of a 400 column window still counts.
+        let none = [0.0; 2];
+        assert!(!corner_moved(then, [0.7208, 0.0208, 0.27, 0.12], none));
+        assert!(corner_moved(then, [0.7175, 0.02, 0.27, 0.12], none));
     }
 }
