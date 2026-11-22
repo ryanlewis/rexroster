@@ -123,7 +123,7 @@ rexroster lua --loader >> ~/.config/rex/init.lua
 rex config reload
 ```
 
-The loader runs `rexroster lua` each time Rex loads its config and runs the output, so the actions match the installed binary after an upgrade. It names the `rexroster` your `PATH` finds first when you print it (a version manager's shim, say, which survives upgrades), or else the binary that printed it; if you print it from a build that isn't first on your `PATH`, the loader still names the one that is. It names an absolute path only. If rexroster is missing, fails, or prints Lua that does not run, Rex logs a warning and loads the rest of the config.
+The loader runs `rexroster lua` each time Rex loads its config and runs the output, so the actions match the installed binary after an upgrade. It names the binary that printed it. If that binary is on your `PATH`, the loader uses the `PATH` spelling, so a stable symlink such as Homebrew's survives upgrades; a version manager's shim or an older `rexroster` earlier on your `PATH` is a different file and is skipped. It names an absolute path only. If rexroster is missing, fails, or prints Lua that does not run, Rex logs a warning and loads the rest of the config.
 
 You can instead save a copy and load that:
 
