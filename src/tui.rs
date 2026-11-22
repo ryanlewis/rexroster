@@ -146,6 +146,10 @@ struct App<'a> {
     /// When the refreshes confirming a pending exit started failing, if the
     /// last one failed.
     confirm_failing_since: Option<Instant>,
+    /// Messages taken off the channel before an unconfirmed exit that the
+    /// loop still has to handle, and what the events applied then need.
+    held: Vec<Msg>,
+    held_needs: Needs,
     follow: Follow,
     /// Where the reset control was drawn; empty while it isn't shown.
     reset_area: Rect,
@@ -285,6 +289,8 @@ pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
         guard: pin::Guard::default(),
         leaving: None,
         confirm_failing_since: None,
+        held: Vec::new(),
+        held_needs: Needs::default(),
         follow: Follow::default(),
         reset_area: Rect::default(),
     };
@@ -337,7 +343,7 @@ impl App<'_> {
             let rows = self.model.rows(now());
             if !self.model.should_exit(now()) {
                 self.confirm_failing_since = None;
-            } else if self.confirm_exit(Instant::now()) {
+            } else if self.confirm_exit(Instant::now(), rx) {
                 return Ok(());
             }
             let lines = if self.panel.is_some() {
@@ -355,13 +361,20 @@ impl App<'_> {
             let wait = self.fit.retry_at.map_or(tick(&rows), |t| {
                 tick(&rows).min(t.saturating_duration_since(Instant::now()))
             });
-            let first = match rx.recv_timeout(wait) {
-                Ok(msg) => Some(msg),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => bail!("rex events stopped"),
+            // What `confirm_exit` took off the channel is handled first,
+            // without waiting.
+            let held = std::mem::take(&mut self.held);
+            let mut needs = std::mem::take(&mut self.held_needs);
+            let first = if !held.is_empty() || needs != Needs::default() {
+                None
+            } else {
+                match rx.recv_timeout(wait) {
+                    Ok(msg) => Some(msg),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => bail!("rex events stopped"),
+                }
             };
-            let mut needs = Needs::default();
-            for msg in first.into_iter().chain(rx.try_iter()) {
+            for msg in held.into_iter().chain(first).chain(rx.try_iter()) {
                 match msg {
                     Msg::Rex(Some(Event::SessionLabel(label))) => self.on_label(&label),
                     Msg::Rex(Some(event)) => needs = needs.or(self.model.apply(event, now())),
@@ -381,11 +394,14 @@ impl App<'_> {
     /// refresh the listing and exit only if the roster is still done: a
     /// worker spawned since the last event keeps it. If the refresh fails,
     /// stay and show the error, unless every refresh since the first failed
-    /// one (`at` is now) has failed for [`EXIT_UNCONFIRMED_AFTER`]: then exit
-    /// anyway. A refresh that works restarts that wait. On exit the lock
-    /// stays held until [`App::leave`], so no spawn runs in between. Without
-    /// the lock it exits all the same.
-    fn confirm_exit(&mut self, at: Instant) -> bool {
+    /// one (`at` is now) has failed for [`EXIT_UNCONFIRMED_AFTER`]. Then it
+    /// first takes the events waiting in `rx` into the model, since a worker
+    /// spawned just now may be among them, and exits anyway only if the
+    /// model still says so; if not, the wait starts over. A refresh that
+    /// works restarts that wait too. On exit the lock stays held until
+    /// [`App::leave`], so no spawn runs in between. Without the lock it
+    /// exits all the same.
+    fn confirm_exit(&mut self, at: Instant, rx: &Receiver<Msg>) -> bool {
         let lock = Lock::acquire(&launch::open_lock(&self.pin));
         let res = self.model.refresh(self.rex, &self.session, now());
         let confirmed = if res.is_ok() {
@@ -393,7 +409,14 @@ impl App<'_> {
             true
         } else {
             let since = *self.confirm_failing_since.get_or_insert(at);
-            at.saturating_duration_since(since) >= EXIT_UNCONFIRMED_AFTER
+            let due = at.saturating_duration_since(since) >= EXIT_UNCONFIRMED_AFTER;
+            if due {
+                self.take_pending(rx);
+                if !self.model.should_exit(now()) {
+                    self.confirm_failing_since = None;
+                }
+            }
+            due
         };
         let exit = confirmed && self.model.should_exit(now());
         self.report(res);
@@ -401,6 +424,19 @@ impl App<'_> {
             self.leaving = lock.ok();
         }
         exit
+    }
+
+    /// Apply the events waiting in `rx` to the model, keeping what they need
+    /// fetched and the other messages for the loop to handle.
+    fn take_pending(&mut self, rx: &Receiver<Msg>) {
+        for msg in rx.try_iter() {
+            match msg {
+                Msg::Rex(Some(event)) if !matches!(event, Event::SessionLabel(_)) => {
+                    self.held_needs = self.held_needs.or(self.model.apply(event, now()));
+                }
+                other => self.held.push(other),
+            }
+        }
     }
 
     /// Leave for good, under the open lock: give up the roster's label, so a
@@ -1427,6 +1463,8 @@ mod tests {
             guard: pin::Guard::default(),
             leaving: None,
             confirm_failing_since: None,
+            held: Vec::new(),
+            held_needs: Needs::default(),
             follow: Follow::default(),
             reset_area: Rect::default(),
         }
@@ -1656,7 +1694,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
                 open_gate.send(()).unwrap();
             });
-            let exit = a.confirm_exit(Instant::now());
+            let exit = a.confirm_exit(Instant::now(), &mpsc::channel().1);
             if exit {
                 a.leave();
             }
@@ -1682,7 +1720,7 @@ mod tests {
         let dir = crate::lock::temp_dir("tui-exit-race-after");
         let server = Server::default();
         let mut a = roster_whose_last_worker_closed(&server, &dir);
-        assert!(a.confirm_exit(Instant::now()));
+        assert!(a.confirm_exit(Instant::now(), &mpsc::channel().1));
         // No spawn can slip in between deciding to exit and leaving.
         let lock = launch::open_lock(&a.pin);
         *server.lock.lock().unwrap() = Some(lock.clone());
@@ -1741,14 +1779,15 @@ mod tests {
     #[test]
     fn a_listing_that_keeps_failing_exits_after_the_window_and_keeps_the_pin() {
         let rex = Fake::default();
+        let (_tx, rx) = mpsc::channel();
         let dir = crate::lock::temp_dir("tui-exit-failing");
         let mut a = fake_roster_done(&rex, &dir);
         rex.fail("session.list_blocks");
         let t0 = Instant::now();
-        assert!(!a.confirm_exit(t0));
+        assert!(!a.confirm_exit(t0, &rx));
         assert!(a.error.is_some());
-        assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER - Duration::from_secs(1)));
-        assert!(a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER));
+        assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER - Duration::from_secs(1), &rx));
+        assert!(a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER, &rx));
         // Rex is no better at relabelling: the pin stays for the next spawn.
         rex.fail("session.set_block_label");
         a.leave();
@@ -1756,13 +1795,39 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_queued_before_an_unconfirmed_exit_keeps_the_roster() {
+        let rex = Fake::default();
+        let (tx, rx) = mpsc::channel();
+        let dir = crate::lock::temp_dir("tui-exit-queued");
+        let mut a = fake_roster_done(&rex, &dir);
+        rex.fail("session.list_blocks");
+        let t0 = Instant::now();
+        assert!(!a.confirm_exit(t0, &rx));
+        // A spawn made a block whose event hasn't been handled yet.
+        tx.send(Msg::Rex(Some(Event::BlockCreated("block:w2".into()))))
+            .unwrap();
+        tx.send(Msg::Rex(Some(Event::SessionLabel("w2".into()))))
+            .unwrap();
+        assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER, &rx));
+        assert!(a.leaving.is_none());
+        // The wait starts over, and the loop still gets what it didn't apply.
+        assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER * 2, &rx));
+        assert!(matches!(
+            a.held.as_slice(),
+            [Msg::Rex(Some(Event::SessionLabel(l)))] if l == "w2"
+        ));
+        assert!(a.held_needs.blocks);
+    }
+
+    #[test]
     fn a_listing_that_works_restarts_the_wait() {
         let rex = Fake::default();
+        let (_tx, rx) = mpsc::channel();
         let dir = crate::lock::temp_dir("tui-exit-reset");
         let mut a = fake_roster_done(&rex, &dir);
         rex.fail("session.list_blocks");
         let t0 = Instant::now();
-        assert!(!a.confirm_exit(t0));
+        assert!(!a.confirm_exit(t0, &rx));
         // The listing works again and shows a new worker, which keeps the roster.
         rex.heal();
         rex.on(
@@ -1774,14 +1839,14 @@ mod tests {
             json!({"records": [{"id": "meta", "app": "rexlead", "state": "idle",
                 "msg": r#"{"lead":"block:lead"}"#}]}),
         );
-        assert!(!a.confirm_exit(t0 + Duration::from_secs(20)));
+        assert!(!a.confirm_exit(t0 + Duration::from_secs(20), &rx));
         // It closes and the listing fails again: the wait starts over.
         a.model.apply(Event::BlockClosed("block:w2".into()), now());
         assert!(a.model.should_exit(now()));
         rex.fail("session.list_blocks");
         let t1 = t0 + EXIT_UNCONFIRMED_AFTER + Duration::from_secs(1);
-        assert!(!a.confirm_exit(t1));
-        assert!(a.confirm_exit(t1 + EXIT_UNCONFIRMED_AFTER));
+        assert!(!a.confirm_exit(t1, &rx));
+        assert!(a.confirm_exit(t1 + EXIT_UNCONFIRMED_AFTER, &rx));
     }
 
     fn render(app: &mut App, rows: &[Row]) -> String {
