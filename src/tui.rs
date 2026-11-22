@@ -1610,10 +1610,16 @@ mod tests {
             .lock()
             .unwrap()
             .push(("block:me".into(), launch::roster_label("block:lead")));
-        let mut a = app(server);
-        a.pin = pin::path(dir, "s", "block:lead");
+        last_worker_closed(server, pin::path(dir, "s", "block:lead"))
+    }
+
+    /// A roster on `rex`, whose listing the caller has seeded, with the
+    /// lead's name pinned at `pin` and its only worker just closed.
+    fn last_worker_closed(rex: &dyn Rex, pin: PathBuf) -> App<'_> {
+        let mut a = app(rex);
+        a.pin = pin;
         pin::write(&a.pin, "lead name").unwrap();
-        a.model.refresh(server, "s", now()).unwrap();
+        a.model.refresh(rex, "s", now()).unwrap();
         live_worker(&mut a);
         a.model.apply(Event::BlockClosed("block:w".into()), now());
         assert!(a.model.should_exit(now()));
@@ -1693,15 +1699,8 @@ mod tests {
     /// A roster on a fake Rex whose only worker has closed, with the lead's
     /// name pinned: the model says exit.
     fn fake_roster_done<'a>(rex: &'a Fake, dir: &Path) -> App<'a> {
-        let mut a = app(rex);
-        a.pin = dir.join("pin");
-        pin::write(&a.pin, "lead name").unwrap();
         rex.on("session.list_blocks", json!({"blocks": []}));
-        a.model.refresh(rex, "s", now()).unwrap();
-        live_worker(&mut a);
-        a.model.apply(Event::BlockClosed("block:w".into()), now());
-        assert!(a.model.should_exit(now()));
-        a
+        last_worker_closed(rex, dir.join("pin"))
     }
 
     #[test]
