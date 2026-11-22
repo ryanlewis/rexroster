@@ -119,8 +119,9 @@ local function removed(ctx, ev)
   if removes_root(ev) then sink(ctx.block_id, false) end
 end
 
--- Rex sends program_status_removed (also when a program exits); src/events.rs
--- reads program_status_cleared the same way, so the watcher does too.
+-- Rex sends program_status_removed (also when a program exits). Rex's events
+-- reference doesn't list program_status_cleared and it hasn't been seen, but
+-- src/events.rs reads it as a removal, so the watcher does too.
 rex.on("terminal.program_status_removed", removed)
 rex.on("terminal.program_status_cleared", removed)
 rex.on("block_closed", function(_, ev) sink(ev.block_id, true) end)

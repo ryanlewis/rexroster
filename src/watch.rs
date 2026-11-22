@@ -176,6 +176,10 @@ mod tests {
                 status("program_status_changed", r#"{"id":"","record":{}}"#),
                 "sink",
             ),
+            (
+                status("program_status_removed", r#"{"ids":["a",null]}"#),
+                "ignore",
+            ),
         ];
         captured
             .lines()

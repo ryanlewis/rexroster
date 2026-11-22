@@ -85,11 +85,14 @@ fn block_event(block: String, payload: &Value) -> Option<Event> {
                 ids: vec![id],
             }),
         },
-        // A removal names its records in `ids`; a null one is the root.
+        // A removal names its records in `ids`; a null `ids` is the root.
+        // A null inside `ids` names nothing: the watcher's Lua never sees it,
+        // as rex.json drops nulls from arrays.
         "program_status_removed" | "program_status_cleared" => {
             let ids = match inner["ids"].as_array() {
                 Some(ids) => ids
                     .iter()
+                    .filter(|i| !i.is_null())
                     .map(|i| i.as_str().unwrap_or_default().to_owned())
                     .collect(),
                 None => vec![id],
