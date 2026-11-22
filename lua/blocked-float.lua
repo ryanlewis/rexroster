@@ -88,8 +88,13 @@ local function sink(block_id, closed)
 end
 
 rex.on("terminal.program_status_changed", function(ctx, ev)
-  -- Only the program's own record (no id), not its sub-tasks.
+  -- Only the program's own record (no id), not its sub-tasks. src/events.rs
+  -- turns every record into a roster row, so it tracks each id; the watcher
+  -- floats on the prompt the worker itself is waiting on, so a subagent's
+  -- record, set or removed, never moves the block.
   if type(ev.id) == "string" and ev.id ~= "" then return end
+  -- A null record, or one without a state, is a removal, as in
+  -- src/events.rs, so it sinks the block like any state but blocked.
   local state = type(ev.record) == "table" and ev.record.state
   if state == "blocked" then
     if not floated[ctx.block_id] then float(ctx.session_id, ctx.block_id, ev.record.msg) end
@@ -110,7 +115,13 @@ local function removes_root(ev)
   return false
 end
 
-rex.on("terminal.program_status_removed", function(ctx, ev)
+local function removed(ctx, ev)
   if removes_root(ev) then sink(ctx.block_id, false) end
-end)
+end
+
+-- Rex sends program_status_removed (also when a program exits). Rex's events
+-- reference doesn't list program_status_cleared and it hasn't been seen, but
+-- src/events.rs reads it as a removal, so the watcher does too.
+rex.on("terminal.program_status_removed", removed)
+rex.on("terminal.program_status_cleared", removed)
 rex.on("block_closed", function(_, ev) sink(ev.block_id, true) end)
