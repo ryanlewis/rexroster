@@ -426,12 +426,14 @@ impl App<'_> {
         exit
     }
 
-    /// Apply the events waiting in `rx` to the model, keeping what they need
-    /// fetched and the other messages for the loop to handle.
+    /// Handle the Rex events waiting in `rx`, in order, as the loop would,
+    /// keeping what they need fetched. Terminal input and the end of the
+    /// stream are kept for the loop. If the roster exits anyway, those go.
     fn take_pending(&mut self, rx: &Receiver<Msg>) {
         for msg in rx.try_iter() {
             match msg {
-                Msg::Rex(Some(event)) if !matches!(event, Event::SessionLabel(_)) => {
+                Msg::Rex(Some(Event::SessionLabel(label))) => self.on_label(&label),
+                Msg::Rex(Some(event)) => {
                     self.held_needs = self.held_needs.or(self.model.apply(event, now()));
                 }
                 other => self.held.push(other),
@@ -1806,17 +1808,51 @@ mod tests {
         // A spawn made a block whose event hasn't been handled yet.
         tx.send(Msg::Rex(Some(Event::BlockCreated("block:w2".into()))))
             .unwrap();
-        tx.send(Msg::Rex(Some(Event::SessionLabel("w2".into()))))
-            .unwrap();
+        tx.send(Msg::Term(TermEvent::FocusGained)).unwrap();
         assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER, &rx));
         assert!(a.leaving.is_none());
         // The wait starts over, and the loop still gets what it didn't apply.
         assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER * 2, &rx));
         assert!(matches!(
             a.held.as_slice(),
-            [Msg::Rex(Some(Event::SessionLabel(l)))] if l == "w2"
+            [Msg::Term(TermEvent::FocusGained)]
         ));
         assert!(a.held_needs.blocks);
+    }
+
+    #[test]
+    fn a_rename_queued_before_an_unconfirmed_exit_is_judged_in_order() {
+        let rex = Fake::default();
+        let (tx, rx) = mpsc::channel();
+        let dir = crate::lock::temp_dir("tui-exit-order");
+        let mut a = fake_roster_done(&rex, &dir);
+        rex.fail("session.list_blocks");
+        let t0 = Instant::now();
+        assert!(!a.confirm_exit(t0, &rx));
+        // The session is renamed while no worker is live, then one starts.
+        tx.send(Msg::Rex(Some(Event::SessionLabel("renamed".into()))))
+            .unwrap();
+        let meta = crate::model::Record {
+            app: "rexlead".into(),
+            state: "idle".into(),
+            msg: Some(r#"{"lead":"block:lead"}"#.into()),
+            updated_at: None,
+        };
+        tx.send(Msg::Rex(Some(Event::Status {
+            block: "block:w2".into(),
+            id: "meta".into(),
+            record: meta,
+        })))
+        .unwrap();
+        assert!(!a.confirm_exit(t0 + EXIT_UNCONFIRMED_AFTER, &rx));
+        // Handle what was held as the loop would.
+        for msg in std::mem::take(&mut a.held) {
+            if let Msg::Rex(Some(Event::SessionLabel(label))) = msg {
+                a.on_label(&label);
+            }
+        }
+        // The rename came before the worker, so it stands.
+        assert!(rex.params("session.set_label").is_empty());
     }
 
     #[test]
