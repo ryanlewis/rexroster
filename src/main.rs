@@ -130,7 +130,10 @@ fn run(cli: Cli) -> Result<()> {
                 label.as_deref(),
                 &lock::dir(),
             )?;
-            println!("{pinned}");
+            println!("{}", pinned.label);
+            if let Some(warning) = pinned.warning {
+                eprintln!("rexroster: {warning}");
+            }
             Ok(())
         }
         Some(Command::Watch | Command::Skill) => unreachable!("handled above"),
