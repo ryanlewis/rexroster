@@ -130,8 +130,11 @@ pub fn run(
         Some(_) => anyhow::bail!("the label is empty"),
         None => session_label(rex, session)?.context("the session has no label to pin")?,
     };
-    // Pin first, so the roster sees our rename as the pinned label.
+    // Pin first, so the roster sees our rename as the pinned label. The
+    // open lock, held to the end, keeps spawn, the roster's leave and other
+    // pins from writing the pin between our write and any restore.
     let pin = path(dir, session, lead);
+    let _lock = lock::Lock::acquire(&crate::launch::open_lock(&pin))?;
     let before = read(&pin);
     write(&pin, &label)?;
     let renamed = session_label(rex, session).and_then(|current| match current {
@@ -146,8 +149,8 @@ pub fn run(
             return Ok(label);
         }
         // The session keeps its old name, so it keeps its old pin too,
-        // unless a spawn or another pin has written the pin since. A write
-        // between this check and the restore can still be lost.
+        // unless the pin was written since by a writer that couldn't take
+        // the lock, such as a roster leaving without it.
         if read(&pin).as_deref() == Some(&label) {
             match before {
                 Some(b) => {
@@ -293,6 +296,30 @@ mod tests {
         write(&p, "old").unwrap();
         assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
         assert_eq!(read(&p).as_deref(), Some("theirs"));
+    }
+
+    #[test]
+    fn pin_holds_the_open_lock_while_it_renames_and_restores() {
+        let dir = lock::temp_dir("pin-run-lock");
+        let p = path(&dir, "s", "L");
+        write(&p, "old").unwrap();
+        let rex = Fake::default();
+        rex.on("session.view", json!({"label": "worker-name"}));
+        let held = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (h, l) = (held.clone(), crate::launch::open_lock(&p));
+        rex.on_call("session.set_label", move |_| {
+            h.set(lock::Lock::try_acquire(&l).unwrap().is_none())
+        });
+        rex.fail("session.set_label");
+        assert!(run(&rex, "s", "L", Some("mine"), &dir).is_err());
+        assert!(held.get(), "renamed without the open lock");
+        assert_eq!(read(&p).as_deref(), Some("old"));
+        // Released once run returns.
+        assert!(
+            lock::Lock::try_acquire(&crate::launch::open_lock(&p))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
