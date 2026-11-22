@@ -75,10 +75,10 @@ The roster lists a block only when this record names its own lead.
 By default the roster has no frame or title, because Rex's pane title already names it. In the compact view (the default) each worker takes one line:
 
 - `›` on the selected worker, while the roster has focus
-- a glyph for the state of the worker's root status record (the one Claude Code reports): a turning braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) while working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
+- a glyph for the worker's state: that of its root status record (the one Claude Code reports), or, while that is idle or done, working or blocked if any of its subagents is: a turning braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) while working, `◐` blocked, `✓` done, `✗` error, `○` idle, `·` starting
 - `▸` if the worker is shown
 - the label, in a column as wide as the longest label (6 to 20 characters)
-- how long it has been in its state, except while it is working, when this is blank
+- how long it has been in its state, except while it is working, when this is blank. After subagents, this counts from when the last one stopped
 
 Press `v` for the expanded view. Each worker then has a line with its label and time, then the record's message wrapped to the pane width (at most 3 lines), then its task in dim text if that differs from the message. When there is no message, the task takes its place. When the record carries the worker's `cwd`, that path in the message shows as `.`, and a leading `cd <cwd> && ` or `cd <cwd>; ` is dropped.
 

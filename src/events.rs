@@ -26,10 +26,10 @@ pub enum Event {
         id: String,
         record: Record,
     },
-    /// A program-status record was removed.
+    /// Program-status records were removed.
     StatusRemoved {
         block: String,
-        id: String,
+        ids: Vec<String>,
     },
     /// Windows, layers or placement changed.
     ViewChanged,
@@ -80,10 +80,21 @@ fn block_event(block: String, payload: &Value) -> Option<Event> {
     match payload["name"].as_str()? {
         "program_status_changed" => match Record::from_json(&inner["record"]) {
             Some(record) => Some(Event::Status { block, id, record }),
-            None => Some(Event::StatusRemoved { block, id }),
+            None => Some(Event::StatusRemoved {
+                block,
+                ids: vec![id],
+            }),
         },
+        // A removal names its records in `ids`; a null one is the root.
         "program_status_removed" | "program_status_cleared" => {
-            Some(Event::StatusRemoved { block, id })
+            let ids = match inner["ids"].as_array() {
+                Some(ids) => ids
+                    .iter()
+                    .map(|i| i.as_str().unwrap_or_default().to_owned())
+                    .collect(),
+                None => vec![id],
+            };
+            Some(Event::StatusRemoved { block, ids })
         }
         _ => None,
     }
@@ -195,7 +206,20 @@ mod tests {
             parse(line),
             Some(Event::StatusRemoved {
                 block: "b".into(),
-                id: "meta".into()
+                ids: vec!["meta".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn a_removal_names_its_records_in_ids() {
+        // As recorded when a Claude Code subagent finished.
+        let line = r#"{"type":"session_event","payload":{"session_id":"s","event":{"type":"block_event","payload":{"block_id":"b","creator_name":"com.superlogical.terminal","name":"program_status_removed","payload":{"ids":["a3467379b2f7b231a"],"reason":"clear"}}}}}"#;
+        assert_eq!(
+            parse(line),
+            Some(Event::StatusRemoved {
+                block: "b".into(),
+                ids: vec!["a3467379b2f7b231a".into()]
             })
         );
     }
