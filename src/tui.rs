@@ -963,13 +963,9 @@ impl App<'_> {
         let sel = self.selected_index(rows);
         // The selection only matters to keys and clicks, so mark it only
         // while the roster has focus. It still decides the scroll below.
-        let laid = layout(
-            rows,
-            sel.filter(|_| self.focused),
-            area.width,
-            self.spin_start.elapsed(),
-            self.expanded(),
-        );
+        let marked = sel.filter(|_| self.focused);
+        let elapsed = self.spin_start.elapsed();
+        let laid = layout(rows, marked, area.width, elapsed, self.expanded());
         let visible = usize::from(list.height);
         // Keep the selected worker on screen when the list is taller than the
         // pane; one taller than the pane shows from its header down.
@@ -981,19 +977,31 @@ impl App<'_> {
         });
         self.offset = end.saturating_sub(visible).min(start);
         self.line_owner = laid.iter().map(|(o, _)| *o).collect();
+        // A row's first line is where its name and idle time are.
+        let first_row = laid
+            .get(self.offset)
+            .map(|(o, _)| *o)
+            .filter(|&o| self.offset == 0 || laid[self.offset - 1].0 != o);
         let mut lines: Vec<Line> = laid
             .into_iter()
             .skip(self.offset)
             .take(visible)
             .map(|(_, l)| l)
             .collect();
-        // The first line gives up its right `reserve` columns.
+        // The first line gives up its right `reserve` columns. A row line
+        // gives them up from its label, so the idle time stays whole.
         if reserve > 0 && !lines.is_empty() {
             let first = Rect {
                 width: list.width.saturating_sub(reserve),
                 height: 1,
                 ..list
             };
+            if let Some(i) = first_row {
+                let over = lines[0].width().saturating_sub(usize::from(first.width));
+                let mut cols = Columns::for_rows(rows);
+                cols.label = cols.label.saturating_sub(over);
+                lines[0] = row_line(&rows[i], marked == Some(i), cols, elapsed);
+            }
             f.render_widget(Paragraph::new(lines.remove(0)), first);
             let rest = Rect {
                 y: list.y + 1,
@@ -2311,13 +2319,13 @@ mod tests {
             view_pass(&mut a);
             let after = render_at(&mut a, &rows, width, 5);
             let reset = if width >= 40 { RESET } else { RESET_SHORT };
-            let keep = usize::from(width) - reset.width() - 1;
-            let top: String = before.lines().next().unwrap().chars().take(keep).collect();
-            assert_eq!(
-                after.lines().next().unwrap(),
-                format!("{top} {reset}"),
-                "{after}"
-            );
+            // The label gives up the room, cut with `…`; the glyph and the
+            // idle time stay whole, with a space before the control.
+            let top = after.lines().next().unwrap();
+            let label = usize::from(width) - reset.width() - 1 - " ○   1m".width();
+            let cut_label = cut(long, label);
+            assert!(cut_label.ends_with('…'), "{cut_label}");
+            assert_eq!(top, format!(" ○  {cut_label} 1m {reset}"), "{after}");
             // The lines below, and how many there are, don't change.
             assert_eq!(
                 after.lines().skip(1).collect::<Vec<_>>(),
