@@ -9,9 +9,13 @@
 pub const MAX_HEIGHT: f64 = 0.6;
 /// The fewest rows the layer shrinks to: one line plus about a row of window chrome.
 pub const MIN_ROWS: f64 = 2.0;
-/// The fewest columns the roster's terminal should have. Below this, the
-/// key hints and the expanded view's messages are cut short.
+/// The columns the roster's terminal has in the expanded view, where the
+/// messages need them.
 pub const MIN_COLUMNS: u16 = 50;
+/// The fewest columns in the compact view, so a short label isn't a sliver.
+pub const COMPACT_MIN_COLUMNS: u16 = 20;
+/// The columns the options panel needs while it is open, border aside.
+pub const PANEL_COLUMNS: u16 = 30;
 
 use std::time::Duration;
 
@@ -130,23 +134,31 @@ impl RowScale {
     }
 }
 
-/// The new layer `x` and width when the roster has fewer than `MIN_COLUMNS`
-/// columns, or `None` when it has enough (or can't grow).
+/// The new layer `x` and width when the roster's terminal has other than
+/// `want` columns, or `None` when it has them (or can't change).
 ///
 /// - `cols`: columns its terminal has now.
 /// - `per_col`: one column's share of the window width, from the lead's pane.
 /// - `x`, `w`: the layer's current left edge and width, as window fractions.
+/// - `narrow`: whether it may shrink. It may not once the user has set the
+///   width by hand, so a layer widened by hand keeps its width.
 ///
-/// The layer grows to the left, keeping its right edge, and stops at the
-/// window's left edge. It never shrinks, so a layer widened by hand keeps its
-/// width.
-pub fn new_width(cols: u16, per_col: f64, x: f64, w: f64) -> Option<(f64, f64)> {
-    let missing = f64::from(MIN_COLUMNS.saturating_sub(cols));
-    if missing == 0.0 || per_col <= 0.0 || !per_col.is_finite() {
+/// The layer grows or shrinks at its left edge, keeping its right edge, and
+/// grows no further than the window's left edge.
+pub fn new_width(
+    cols: u16,
+    want: u16,
+    per_col: f64,
+    x: f64,
+    w: f64,
+    narrow: bool,
+) -> Option<(f64, f64)> {
+    let diff = f64::from(want) - f64::from(cols);
+    if diff == 0.0 || (diff < 0.0 && !narrow) || per_col <= 0.0 || !per_col.is_finite() {
         return None;
     }
     let right = x + w;
-    let target = (w + missing * per_col).min(right);
+    let target = (w + diff * per_col).min(right).max(per_col);
     ((target - w).abs() > 1e-6).then_some((right - target, target))
 }
 
@@ -177,16 +189,21 @@ pub fn corner_place(area: [f64; 4], w: f64, h: f64) -> (f64, f64) {
 /// measured the slack is 0.001, under 0.4 of a column in a window of up to
 /// 400 columns.
 pub fn corner_moved(then: [f64; 4], now: [f64; 4], cell: [f64; 2]) -> bool {
+    off_by_cells(then[0] + then[2], now[0] + now[2], cell[0])
+        || off_by_cells(then[1], now[1], cell[1])
+}
+
+/// Whether two edges or widths `a` and `b`, window fractions, differ by more
+/// than Rex's rounding, on the terms of [`corner_moved`]: `cell` is one
+/// cell's share of the window, `0.0` where unknown.
+pub fn off_by_cells(a: f64, b: f64, cell: f64) -> bool {
     const UNKNOWN: f64 = 0.001;
-    let slack = |c: f64| {
-        if c.is_finite() && c > 0.0 {
-            0.4 * c
-        } else {
-            UNKNOWN
-        }
+    let slack = if cell.is_finite() && cell > 0.0 {
+        0.4 * cell
+    } else {
+        UNKNOWN
     };
-    ((then[0] + then[2]) - (now[0] + now[2])).abs() > slack(cell[0])
-        || (then[1] - now[1]).abs() > slack(cell[1])
+    (a - b).abs() > slack
 }
 
 #[cfg(test)]
@@ -251,28 +268,40 @@ mod tests {
     #[test]
     fn widens_a_narrow_layer_to_the_left() {
         // 100 columns in the window: 20 columns at 0.20 wide.
-        let (x, w) = new_width(20, 0.01, 0.72, 0.20).unwrap();
+        let (x, w) = new_width(20, MIN_COLUMNS, 0.01, 0.72, 0.20, true).unwrap();
         assert!((w - 0.50).abs() < 1e-9, "{w}");
         assert!((x + w - 0.92).abs() < 1e-9, "right edge moved: {x}");
     }
 
     #[test]
-    fn leaves_a_wide_enough_layer_alone() {
-        assert_eq!(new_width(MIN_COLUMNS, 0.01, 0.5, 0.5), None);
-        assert_eq!(new_width(80, 0.01, 0.2, 0.8), None);
+    fn narrows_a_wide_layer_from_the_left() {
+        let (x, w) = new_width(50, 25, 0.01, 0.42, 0.50, true).unwrap();
+        assert!((w - 0.25).abs() < 1e-9, "{w}");
+        assert!((x + w - 0.92).abs() < 1e-9, "right edge moved: {x}");
+        // Not once the user has set the width; widening still happens.
+        assert_eq!(new_width(50, 25, 0.01, 0.42, 0.50, false), None);
+        assert!(new_width(20, 25, 0.01, 0.42, 0.50, false).is_some());
+    }
+
+    #[test]
+    fn leaves_a_layer_of_the_wanted_width_alone() {
+        assert_eq!(
+            new_width(MIN_COLUMNS, MIN_COLUMNS, 0.01, 0.5, 0.5, true),
+            None
+        );
     }
 
     #[test]
     fn widens_no_further_than_the_left_edge() {
         // 40 columns in the whole window.
-        assert_eq!(new_width(10, 0.025, 0.7, 0.25), Some((0.0, 0.95)));
-        assert_eq!(new_width(38, 0.025, 0.0, 0.95), None);
+        assert_eq!(new_width(10, 50, 0.025, 0.7, 0.25, true), Some((0.0, 0.95)));
+        assert_eq!(new_width(38, 50, 0.025, 0.0, 0.95, true), None);
     }
 
     #[test]
     fn ignores_a_bad_column_width() {
-        assert_eq!(new_width(10, 0.0, 0.7, 0.25), None);
-        assert_eq!(new_width(10, f64::NAN, 0.7, 0.25), None);
+        assert_eq!(new_width(10, 50, 0.0, 0.7, 0.25, true), None);
+        assert_eq!(new_width(10, 50, f64::NAN, 0.7, 0.25, true), None);
     }
 
     #[test]

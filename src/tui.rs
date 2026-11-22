@@ -48,6 +48,10 @@ const RESET_SHORT: &str = "↺";
 
 /// Key hints, shown on the last line while the roster has focus.
 pub const FOOTER: &str = "⏎ show · v view · o options · l lead · q quit";
+/// The widest idle time `short_age` gives under 100 days, such as `59m`.
+const AGE_WIDTH: usize = 3;
+/// The key hints where the full ones don't fit.
+pub const FOOTER_SHORT: &str = "⏎ v o l r q";
 /// Hints on the options panel's last line.
 pub const PANEL_HINTS: &str = "⏎ change · esc save and close";
 /// Lines the options panel takes: a heading, one per option, the hints.
@@ -154,6 +158,8 @@ struct Follow {
     /// One column's and one row's share of the window, once measured, so a
     /// corner off by less than a cell isn't taken for a drag.
     cell: [f64; 2],
+    /// The user set the layer's width, so it is never narrowed.
+    user_width: bool,
 }
 
 /// What `rexroster` starts the TUI with.
@@ -233,6 +239,8 @@ struct Fit {
     retry_at: Option<Instant>,
     /// A fresh view to place the layer by: the layout may have changed.
     place: bool,
+    /// The columns the roster's terminal should have; 0 until noted.
+    want_cols: u16,
     /// A fit waiting for the lead to show again: another pane was zoomed
     /// over it, so its rows couldn't be measured.
     hidden: bool,
@@ -329,6 +337,7 @@ impl App<'_> {
                 total_lines(&rows, self.width, self.expanded())
             };
             self.note_rows(lines);
+            self.note_columns(self.wanted_columns(&rows));
             self.fit_if_due();
             terminal.draw(|f| self.draw(f, &rows))?;
 
@@ -472,8 +481,52 @@ impl App<'_> {
                 want,
                 last_resize: self.fit.last_resize,
                 place: self.fit.place,
+                want_cols: self.fit.want_cols,
                 ..Fit::default()
             };
+        }
+    }
+
+    /// Note the columns the pane needs, on the terms of [`Self::note_rows`].
+    fn note_columns(&mut self, cols: u16) {
+        if cols != self.fit.want_cols {
+            self.fit = Fit {
+                dirty: true,
+                want: self.fit.want,
+                last_resize: self.fit.last_resize,
+                place: self.fit.place,
+                want_cols: cols,
+                ..Fit::default()
+            };
+        }
+    }
+
+    /// The columns the pane needs. Compact: the widest row and a column to
+    /// spare, at least `COMPACT_MIN_COLUMNS`. Rows are measured with the
+    /// idle time at its widest, so the width holds as times tick over and
+    /// workers start and stop working. Expanded: `MIN_COLUMNS`, for
+    /// the messages. The options panel, while open, needs `PANEL_COLUMNS`.
+    fn wanted_columns(&self, rows: &[Row]) -> u16 {
+        let chrome = 2 * u16::from(self.opts.border == Border::Rounded);
+        let view = if self.expanded() {
+            size::MIN_COLUMNS
+        } else {
+            let cols = Columns {
+                age: AGE_WIDTH,
+                ..Columns::for_rows(rows)
+            };
+            let widest = rows
+                .iter()
+                .map(|r| row_line(r, false, cols, Duration::ZERO).width())
+                .max()
+                .unwrap_or(0);
+            let widest = u16::try_from(widest).unwrap_or(u16::MAX);
+            (widest.saturating_add(1 + chrome)).max(size::COMPACT_MIN_COLUMNS)
+        };
+        if self.panel.is_some() {
+            view.max(size::PANEL_COLUMNS + chrome)
+        } else {
+            view
         }
     }
 
@@ -526,6 +579,12 @@ impl App<'_> {
             sizing = false;
         } else if std::mem::take(&mut self.fit.hidden) {
             sizing = self.fit.attempts < MAX_FITS;
+        }
+        // A width other than the roster last set is the user's.
+        if let Some(set) = self.follow.set
+            && size::off_by_cells(set[2], bounds[2], self.follow.cell[0])
+        {
+            self.follow.user_width = true;
         }
         let mut target = bounds;
         let mut sized = false;
@@ -608,6 +667,8 @@ impl App<'_> {
             ..Follow::default()
         };
         self.fit.place = true;
+        // A width the user set is let go too, so the width fits again.
+        self.fit.dirty = true;
     }
 
     /// If the layer doesn't fit, the height and the left edge and width it
@@ -644,8 +705,11 @@ impl App<'_> {
             Some(lead_w / f64::from(rex::drawn_columns(&lead_size)?))
         })();
         self.follow.cell = [per_col.unwrap_or(0.0), per_row];
-        let new_w = per_col.and_then(|per_col| {
-            size::new_width(rex::drawn_columns(&my_size)?, per_col, bounds[0], bounds[2])
+        let want = self.fit.want_cols;
+        let narrow = !self.follow.user_width;
+        let new_w = per_col.filter(|_| want > 0).and_then(|per_col| {
+            let cols = rex::drawn_columns(&my_size)?;
+            size::new_width(cols, want, per_col, bounds[0], bounds[2], narrow)
         });
         Some((new_h, new_w))
     }
@@ -901,7 +965,14 @@ impl App<'_> {
     fn footer_line(&self, width: usize) -> Line<'static> {
         match self.shown_error() {
             Some(err) => Line::styled(cut(err, width), Style::new().fg(Color::Red)),
-            None => Line::styled(cut(FOOTER, width), Style::new().add_modifier(Modifier::DIM)),
+            None => {
+                let hints = if FOOTER.width() <= width {
+                    FOOTER
+                } else {
+                    FOOTER_SHORT
+                };
+                Line::styled(cut(hints, width), Style::new().add_modifier(Modifier::DIM))
+            }
         }
     }
 
@@ -1712,8 +1783,11 @@ mod tests {
         let screen = render_at(&mut a, &rows, 40, 2);
         assert_eq!(
             screen.lines().nth(1),
-            Some("⏎ show · v view · o options · l lead ·… ")
+            Some("⏎ v o l r q                             ")
         );
+        // Where the full hints fit, they show.
+        let screen = render_at(&mut a, &rows, 50, 2);
+        assert_eq!(screen.lines().nth(1).map(str::trim_end), Some(FOOTER));
         a.on_terminal_event(&TermEvent::FocusLost, &rows);
         assert!(!render_at(&mut a, &rows, 40, 2).contains("l lead"));
     }
@@ -1922,6 +1996,7 @@ mod tests {
         let mut a = app(&rex);
         a.model.me = Some("block:roster".into());
         a.note_rows(3);
+        a.note_columns(size::MIN_COLUMNS);
         a.fit_layer();
         assert!(
             (a.follow.cell[0] - 0.005).abs() < 1e-9,
@@ -1973,6 +2048,7 @@ mod tests {
         let mut a = app(&rex);
         a.model.me = Some("block:roster".into());
         a.note_rows(3);
+        a.note_columns(size::MIN_COLUMNS);
         a.fit_layer();
         let p = &rex.params("session.resize_layer")[0];
         let b: Vec<f64> = p["bounds"]
@@ -2225,6 +2301,140 @@ mod tests {
         rex.on("session.view", laid_out(FULL, [x - 0.01, y, w, h]));
         view_pass(&mut a);
         assert!(a.follow.dragged);
+    }
+
+    /// The lead fills a window of 100 columns and 50 rows; the roster is at
+    /// `bounds`, `cols` columns wide, and already has the rows it wants.
+    fn columns_at(rex: &Fake, a: &App, bounds: [f64; 4], cols: u16) {
+        rex.on("session.view", laid_out(FULL, bounds));
+        rex.on(
+            "block:lead size",
+            json!({"rows": 50, "columns": 100, "desired": [{"rows": 50}]}),
+        );
+        let rows = a.fit.want;
+        rex.on(
+            "block:roster size",
+            json!({"rows": rows, "columns": cols, "desired": [{"rows": rows}]}),
+        );
+    }
+
+    /// One pass of the run loop: note what the rows need, then fit.
+    fn width_pass(a: &mut App, rows: &[Row]) {
+        a.note_rows(total_lines(rows, a.width, a.expanded()));
+        a.note_columns(a.wanted_columns(rows));
+        a.sync(Needs {
+            view: true,
+            blocks: false,
+        });
+        a.fit_if_due();
+    }
+
+    /// The roster's terminal now has `cols` columns at the last bounds it set.
+    fn landed(rex: &Fake, a: &App, cols: u16) -> [f64; 4] {
+        let n = rex.params("session.resize_layer").len();
+        let b = resized(rex, n - 1);
+        columns_at(rex, a, b, cols);
+        b
+    }
+
+    const RIGHT: f64 = 0.72 + 0.27;
+
+    #[test]
+    fn wanted_columns_follow_the_view_and_the_panel() {
+        let rex = Fake::default();
+        let mut a = app(&rex);
+        let short = [row("block:1", "a", "idle", false)];
+        let long = [row("block:1", "a-twenty-column-name", "idle", false)];
+        // Compact: the widest row (glyph, marker, label, time) and a column.
+        assert_eq!(a.wanted_columns(&short), size::COMPACT_MIN_COLUMNS);
+        assert_eq!(a.wanted_columns(&long), 4 + 20 + 4 + 1);
+        a.opts.border = Border::Rounded;
+        assert_eq!(a.wanted_columns(&long), 4 + 20 + 4 + 1 + 2);
+        a.panel = Some(Panel {
+            cursor: 0,
+            start: a.opts,
+        });
+        assert_eq!(a.wanted_columns(&short), size::PANEL_COLUMNS + 2);
+        a.panel = None;
+        a.opts.view = View::Expanded;
+        assert_eq!(a.wanted_columns(&short), size::MIN_COLUMNS);
+    }
+
+    #[test]
+    fn the_compact_width_holds_as_idle_times_change() {
+        let rex = Fake::default();
+        let a = app(&rex);
+        let at = |state: &str, age| {
+            let mut r = row("block:1", "a-twenty-column-name", state, false);
+            r.age = Some(age);
+            a.wanted_columns(&[r])
+        };
+        let w = at("idle", 9);
+        assert_eq!(at("idle", 10), w);
+        assert_eq!(at("idle", 600), w);
+        assert_eq!(at("working", 10), w);
+    }
+
+    #[test]
+    fn compact_narrows_to_its_rows_and_v_refits_both_ways() {
+        let rex = Fake::default();
+        // Opened 50 columns wide.
+        rex.on(
+            "session.view",
+            laid_out(FULL, [RIGHT - 0.5, 0.02, 0.5, 0.12]),
+        );
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        view_pass(&mut a);
+        let rows = [row("block:1", "a-twenty-column-name", "idle", false)];
+        a.note_rows(total_lines(&rows, a.width, a.expanded()));
+        columns_at(&rex, &a, [RIGHT - 0.5, 0.02, 0.5, 0.12], 50);
+        width_pass(&mut a, &rows);
+        // 28 columns at 0.01 each, with the right edge where it was.
+        let b = landed(&rex, &a, 29);
+        assert!(close(b, [RIGHT - 0.29, 0.02, 0.29, 0.12]), "{b:?}");
+        width_pass(&mut a, &rows);
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        assert!(!a.follow.dragged && !a.follow.user_width);
+        // v: the expanded view widens to 50 columns.
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('v').into()), &rows);
+        width_pass(&mut a, &rows);
+        let b = landed(&rex, &a, 50);
+        assert!(
+            (b[2] - 0.5).abs() < 1e-9 && (b[0] + b[2] - RIGHT).abs() < 1e-9,
+            "{b:?}"
+        );
+        // And back.
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('v').into()), &rows);
+        width_pass(&mut a, &rows);
+        let b = landed(&rex, &a, 29);
+        assert!(close(b, [RIGHT - 0.29, 0.02, 0.29, 0.12]), "{b:?}");
+        assert!(!a.follow.dragged && !a.follow.user_width);
+    }
+
+    #[test]
+    fn a_roster_widened_by_hand_is_not_narrowed_until_r() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        let rows = [row("block:1", "a-twenty-column-name", "idle", false)];
+        a.note_rows(total_lines(&rows, a.width, a.expanded()));
+        columns_at(&rex, &a, START, 27);
+        width_pass(&mut a, &rows);
+        let b = landed(&rex, &a, 29);
+        // The user drags the left edge out to 60 columns.
+        columns_at(&rex, &a, [RIGHT - 0.6, b[1], 0.6, b[3]], 60);
+        width_pass(&mut a, &rows);
+        assert!(a.follow.user_width && !a.follow.dragged);
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        // A row count change refits the height, not the width.
+        a.fit.dirty = true;
+        a.fit_if_due();
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        // r lets the width go.
+        a.on_terminal_event(&TermEvent::Key(KeyCode::Char('r').into()), &rows);
+        a.fit_if_due();
+        let b = resized(&rex, 1);
+        assert!(close(b, [RIGHT - 0.29, 0.02, 0.29, 0.12]), "{b:?}");
     }
 
     #[test]
@@ -2661,7 +2871,7 @@ mod tests {
             [
                 "╭ workers ───────────────────╮",
                 "│›◐  alpha  5s               │",
-                "╰⏎ show · v view · o options…╯",
+                "╰⏎ v o l r q─────────────────╯",
             ]
             .join("\n")
         );
@@ -2673,7 +2883,7 @@ mod tests {
                 "│›◐  alpha  5s               │",
                 "│    Running tests           │",
                 "│    fix login               │",
-                "╰⏎ show · v view · o options…╯",
+                "╰⏎ v o l r q─────────────────╯",
             ]
             .join("\n")
         );

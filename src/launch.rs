@@ -13,7 +13,9 @@ use crate::size;
 
 /// Where the roster opens when the lead isn't a tiled pane: top right of the
 /// lead's tab. Over a tiled lead it opens this size at the pane's top right.
-pub const ROSTER_BOUNDS: [f64; 4] = [0.72, 0.02, 0.27, 0.12];
+/// About the compact view's width in a wide window, so the first fit moves
+/// it little.
+pub const ROSTER_BOUNDS: [f64; 4] = [0.84, 0.02, 0.15, 0.12];
 
 /// The roster's block label: `roster-` and the last 6 characters of the lead's id.
 pub fn roster_label(lead: &str) -> String {
@@ -300,7 +302,7 @@ mod tests {
             .iter()
             .map(|v| v.as_f64().unwrap())
             .collect();
-        let want = [0.22, 0.02, 0.27, 0.12];
+        let want = [0.34, 0.02, 0.15, 0.12];
         assert!(
             b.iter().zip(want).all(|(x, y)| (x - y).abs() < 1e-9),
             "{b:?}"
