@@ -184,6 +184,18 @@ pub fn tiled_area_of(view: &Value, block: &str) -> Option<(String, [f64; 4])> {
     })
 }
 
+/// Whether another block is zoomed over `block` in its window, so its
+/// terminal isn't drawn.
+pub fn zoomed_over(view: &Value, block: &str) -> bool {
+    view["windows"].as_array().into_iter().flatten().any(|w| {
+        let tiled_here = w["layers"].as_array().is_some_and(|ls| {
+            ls.iter()
+                .any(|l| l["kind"].as_str() == Some("tiled") && layer_holds(l, block))
+        });
+        tiled_here && w["zoomed_block_id"].as_str().is_some_and(|z| z != block)
+    })
+}
+
 fn rect_field(view: &Value, block: &str, i: usize) -> Option<f64> {
     match view {
         Value::Object(map) => {
@@ -363,6 +375,9 @@ mod tests {
             Some(("window:1".to_owned(), [0.0, 0.0, 1.0, 1.0]))
         );
         v["windows"][0]["zoomed_block_id"] = json!("block:other");
+        assert!(zoomed_over(&v, "block:lead"));
+        assert!(!zoomed_over(&v, "block:other"));
+        assert!(!zoomed_over(&view(), "block:lead"));
         assert_eq!(tiled_area_of(&v, "block:lead"), None);
     }
 

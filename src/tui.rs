@@ -233,6 +233,9 @@ struct Fit {
     retry_at: Option<Instant>,
     /// A fresh view to place the layer by: the layout may have changed.
     place: bool,
+    /// A fit waiting for the lead to show again: another pane was zoomed
+    /// over it, so its rows couldn't be measured.
+    hidden: bool,
 }
 
 pub fn run(lead: String, session: String, settings: Settings) -> Result<()> {
@@ -492,7 +495,7 @@ impl App<'_> {
     /// tries again later, backing off, for up to `size::RETRY_TOTAL`. In the
     /// same call, move it to the lead's pane while it follows the lead.
     fn fit_layer(&mut self) {
-        let sizing = std::mem::take(&mut self.fit.dirty) && self.fit.attempts < MAX_FITS;
+        let mut sizing = std::mem::take(&mut self.fit.dirty) && self.fit.attempts < MAX_FITS;
         let placing = std::mem::take(&mut self.fit.place);
         if !sizing && !placing {
             return;
@@ -516,6 +519,14 @@ impl App<'_> {
             }
             return;
         };
+        // While another pane is zoomed over the lead there is nothing to
+        // measure by; the fit waits for a view that shows the lead again.
+        if rex::zoomed_over(view, &self.model.lead) {
+            self.fit.hidden |= sizing;
+            sizing = false;
+        } else if std::mem::take(&mut self.fit.hidden) {
+            sizing = self.fit.attempts < MAX_FITS;
+        }
         let mut target = bounds;
         let mut sized = false;
         if sizing {
@@ -1913,6 +1924,29 @@ mod tests {
         let missing = f64::from(size::MIN_COLUMNS - 20);
         let w = p["bounds"][2].as_f64().unwrap();
         assert!((w - (0.27 + missing * 0.005)).abs() < 1e-9, "{w}");
+    }
+
+    #[test]
+    fn does_not_fit_while_another_pane_is_zoomed_over_the_lead() {
+        let rex = Fake::default();
+        sized(&rex, 1);
+        let mut v: Value = serde_json::from_str(include_str!("../testdata/view.json")).unwrap();
+        v["windows"][0]["zoomed_block_id"] = json!("block:other");
+        rex.on("session.view", v);
+        let mut a = app(&rex);
+        a.model.me = Some("block:roster".into());
+        a.note_rows(3);
+        a.fit_layer();
+        assert!(rex.params("session.resize_layer").is_empty());
+        // The fit waits for the lead to show again, however long that takes.
+        a.fit.retry_at = None;
+        rex.on(
+            "session.view",
+            serde_json::from_str(include_str!("../testdata/view.json")).unwrap(),
+        );
+        view_pass(&mut a);
+        let h = resized(&rex, 0)[3];
+        assert!((h - 0.16).abs() < 1e-9, "{h}");
     }
 
     #[test]
