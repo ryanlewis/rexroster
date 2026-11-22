@@ -167,7 +167,8 @@ pub fn corner_place(area: [f64; 4], w: f64, h: f64) -> (f64, f64) {
 
 /// Whether the top right corner of `now` differs from that of `then`, both
 /// `[x, y, w, h]`. Fitting the height or widening to the left keeps the
-/// corner, so only a move, or a resize from that corner, changes it.
+/// corner, so only a move, or a resize that moves the top or right edge,
+/// changes it.
 pub fn corner_moved(then: [f64; 4], now: [f64; 4]) -> bool {
     const EPS: f64 = 1e-4;
     ((then[0] + then[2]) - (now[0] + now[2])).abs() > EPS || (then[1] - now[1]).abs() > EPS
