@@ -49,7 +49,7 @@ Every command except `watch`, `skill` and `lua` reads the session from `$REX_SES
 | `rexroster tag <lead-block-id> [--task <text>] -- <cmd> [args...]` | Marks the terminal as the lead's worker, then replaces itself with `<cmd>`. |
 | `rexroster watch` | Runs the watcher in the foreground. Exits at once, with status 0, if a watcher is already running for this user and Rex server. |
 | `rexroster skill` | Prints the guide for AI agents, from [`docs/agent.md`](docs/agent.md). |
-| `rexroster lua` | Prints a Lua snippet that adds rexroster's actions to Rex's command palette (see [Palette actions](#palette-actions)). |
+| `rexroster lua [--loader]` | Prints a Lua snippet that adds rexroster's actions to Rex's command palette, or with `--loader`, a loader for `init.lua` that fetches it at config load (see [Palette actions](#palette-actions)). |
 
 Two `open` or `spawn` calls at the same time make only one roster: each holds a lock file while it checks for the roster and creates it. `spawn` holds it from pinning until the roster is open, and the roster holds it while it decides to exit and leaves, so a worker spawned as the last one closes either keeps the roster or gets a new one. `rexroster pin` holds it while it changes the pin and renames the session, so no other writer changes the pin in between. A leaving roster relabels its block `roster (closing)` until the block is gone.
 
@@ -116,7 +116,16 @@ rexroster has no key binding of its own. To move focus between a lead and its ro
 - **Roster: Rename session…** asks for a new name, with the current one filled in, and renames the session through `rexroster pin`, so the roster keeps the new name while workers run. If the session has no live workers, it renames the session directly. If more than one lead in the session has workers, it changes every one's pin, since each lead's roster would put its own pin back.
 - **Roster: Show worker…** lists the session's workers, with each one's task and state, and floats the one you pick beside its lead, as `Enter` does in the roster. It works with the roster closed. A worker that is already shown is left where it is.
 
-To install it, save the snippet and load it from Rex's `init.lua`:
+To install it, add a loader to Rex's `init.lua` and reload:
+
+```sh
+rexroster lua --loader >> ~/.config/rex/init.lua
+rex config reload
+```
+
+The loader runs `rexroster lua` each time Rex loads its config and runs the output, so the actions match the installed binary after an upgrade. It names the `rexroster` your `PATH` finds first when you print it (a version manager's shim, say, which survives upgrades), or else the binary that printed it; if you print it from a build that isn't first on your `PATH`, the loader still names the one that is. It names an absolute path only. If rexroster is missing, fails, or prints Lua that does not run, Rex logs a warning and loads the rest of the config.
+
+You can instead save a copy and load that:
 
 ```sh
 rexroster lua > ~/.config/rex/rexroster.lua
@@ -127,7 +136,7 @@ rexroster lua > ~/.config/rex/rexroster.lua
 dofile(os.getenv("HOME") .. "/.config/rex/rexroster.lua")
 ```
 
-Then run `rex config reload`. The snippet runs rexroster by the path it was printed from; run `rexroster lua` again after installing rexroster somewhere else. Saved without that first line, the actions look for `rexroster` on the Rex server's `PATH`.
+The copy goes stale: it keeps the old actions and the path of the binary that printed it until you save it again. Saved without its first line, the actions look for `rexroster` on the Rex server's `PATH`.
 
 Each action takes its answer as an argument and only asks when it is missing, so a script can run it with nobody there:
 

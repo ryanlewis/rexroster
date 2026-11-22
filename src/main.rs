@@ -12,6 +12,7 @@ mod tag;
 mod tui;
 mod watch;
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -39,9 +40,17 @@ fn run(cli: Cli) -> Result<()> {
             print!("{AGENT_GUIDE}");
             return Ok(());
         }
-        Some(Command::Lua) => {
+        Some(Command::Lua { loader: false }) => {
             let exe = std::env::current_exe().ok();
             print!("{}", palette::script(exe.as_deref()));
+            return Ok(());
+        }
+        Some(Command::Lua { loader: true }) => {
+            // Prefer the PATH spelling (a shim) over the versioned exe.
+            let exe = palette::find_on_path(std::env::var_os("PATH").as_deref())
+                .or_else(|| std::env::current_exe().ok());
+            let exe = exe.as_deref().and_then(Path::to_str).unwrap_or("rexroster");
+            print!("{}", palette::loader(exe));
             return Ok(());
         }
         _ => {}
@@ -146,7 +155,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Watch | Command::Skill | Command::Lua) => unreachable!("handled above"),
+        Some(Command::Watch | Command::Skill | Command::Lua { .. }) => {
+            unreachable!("handled above")
+        }
     }
 }
 
