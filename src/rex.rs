@@ -161,6 +161,29 @@ pub fn rect_width_of(view: &Value, block: &str) -> Option<f64> {
     rect_field(view, block, 2)
 }
 
+/// Where `block` shows in its window's tiled layout, `[x, y, w, h]` as window
+/// fractions, with the window's id. The whole window while it is zoomed.
+/// `None` when it isn't tiled, or another block is zoomed over it.
+pub fn tiled_area_of(view: &Value, block: &str) -> Option<(String, [f64; 4])> {
+    view["windows"].as_array()?.iter().find_map(|w| {
+        let layer = w["layers"]
+            .as_array()?
+            .iter()
+            .find(|l| l["kind"].as_str() == Some("tiled") && layer_holds(l, block))?;
+        let window = w["window_id"].as_str()?.to_owned();
+        match w["zoomed_block_id"].as_str() {
+            Some(z) if z == block => return Some((window, [0.0, 0.0, 1.0, 1.0])),
+            Some(_) => return None,
+            None => {}
+        }
+        let mut rect = [0.0; 4];
+        for (i, slot) in rect.iter_mut().enumerate() {
+            *slot = rect_field(&layer["layout"], block, i)?;
+        }
+        Some((window, rect))
+    })
+}
+
 fn rect_field(view: &Value, block: &str, i: usize) -> Option<f64> {
     match view {
         Value::Object(map) => {
@@ -323,6 +346,24 @@ mod tests {
     #[test]
     fn finds_the_rect_height_in_a_nested_layout() {
         assert_eq!(rect_height_of(&view(), "block:lead"), Some(0.5));
+    }
+
+    #[test]
+    fn finds_the_tiled_area_of_a_block() {
+        let mut v = view();
+        assert_eq!(
+            tiled_area_of(&v, "block:lead"),
+            Some(("window:1".to_owned(), [0.0, 0.0, 1.0, 0.5]))
+        );
+        // Only tiled cells count: the roster floats.
+        assert_eq!(tiled_area_of(&v, "block:roster"), None);
+        v["windows"][0]["zoomed_block_id"] = json!("block:lead");
+        assert_eq!(
+            tiled_area_of(&v, "block:lead"),
+            Some(("window:1".to_owned(), [0.0, 0.0, 1.0, 1.0]))
+        );
+        v["windows"][0]["zoomed_block_id"] = json!("block:other");
+        assert_eq!(tiled_area_of(&v, "block:lead"), None);
     }
 
     #[test]

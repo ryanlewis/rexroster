@@ -3,7 +3,7 @@
 You are a lead: an agent in a Rex terminal that starts other agent sessions
 (workers) to do parts of a task. rexroster runs each worker in a detached Rex
 block, which takes no space on screen, and lists your workers with their state
-in a small floating pane (the roster) at the top right of your tab. The user
+in a small floating pane (the roster) at the top right of your pane. The user
 looks in on a worker from the roster; you read its state with `rex`.
 `rexroster skill` prints this guide.
 
