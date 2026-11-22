@@ -115,7 +115,7 @@ struct Block {
     label: String,
     placed: bool,
     records: HashMap<String, Record>,
-    /// When the root record last changed state, in Unix seconds.
+    /// When the effective state last changed, in Unix seconds.
     since: Option<u64>,
     /// When a `block_created` event announced it, in Unix seconds.
     created: Option<u64>,
@@ -128,24 +128,50 @@ impl Block {
         Meta::from_record(self.records.get("meta")?)
     }
 
-    fn remove_record(&mut self, id: &str) {
-        self.records.remove(id);
-        if id.is_empty() {
+    /// The root record's state, except that an idle or done root shows its
+    /// subagents' records (same app, any other id): blocked if any is
+    /// blocked, else working if any is working. `None` without a root.
+    fn state(&self) -> Option<&str> {
+        let root = self.records.get("")?;
+        if !matches!(root.state.as_str(), "idle" | "done") {
+            return Some(&root.state);
+        }
+        let subagents: Vec<&str> = self
+            .records
+            .iter()
+            .filter(|(id, r)| !id.is_empty() && *id != "meta" && r.app == root.app)
+            .map(|(_, r)| r.state.as_str())
+            .collect();
+        Some(
+            ["blocked", "working"]
+                .into_iter()
+                .find(|s| subagents.contains(s))
+                .unwrap_or(&root.state),
+        )
+    }
+
+    /// Run `change` and restart the age at `at` if the effective state changed.
+    fn track(&mut self, at: u64, change: impl FnOnce(&mut Self)) {
+        let before = self.state().map(str::to_owned);
+        change(self);
+        let after = self.state();
+        if after.is_none() {
             self.since = None;
+        } else if after != before.as_deref() {
+            self.since = Some(at);
         }
     }
 
+    fn remove_record(&mut self, id: &str, now: u64) {
+        self.track(now, |b| {
+            b.records.remove(id);
+        });
+    }
+
     fn set_record(&mut self, id: String, record: Record, now: u64) {
-        if id.is_empty() {
-            let changed = self
-                .records
-                .get("")
-                .is_none_or(|old| old.state != record.state);
-            if changed {
-                self.since = Some(record.updated_at.unwrap_or(now));
-            }
-        }
-        self.records.insert(id, record);
+        self.track(record.updated_at.unwrap_or(now), |b| {
+            b.records.insert(id, record);
+        });
     }
 }
 
@@ -155,7 +181,8 @@ pub struct Row {
     pub block: String,
     pub label: String,
     pub shown: bool,
-    /// The root record's state, or `starting` before it has one.
+    /// The effective state (the root's, or its subagents' while it is idle
+    /// or done), or `starting` before it has a root record.
     pub state: String,
     /// Seconds in the current state, when known.
     pub age: Option<u64>,
@@ -245,9 +272,11 @@ impl Model {
                     .set_record(id, record, now);
                 Needs::default()
             }
-            Event::StatusRemoved { block, id } => {
+            Event::StatusRemoved { block, ids } => {
                 if let Some(b) = self.blocks.get_mut(&block) {
-                    b.remove_record(&id);
+                    for id in ids {
+                        b.remove_record(&id, now);
+                    }
                 }
                 Needs::default()
             }
@@ -339,7 +368,7 @@ impl Model {
                     block: id.clone(),
                     label: b.label.clone(),
                     shown: b.placed,
-                    state: root.map_or_else(|| "starting".to_owned(), |r| r.state.clone()),
+                    state: b.state().unwrap_or("starting").to_owned(),
                     age: b.since.map(|s| now.saturating_sub(s)),
                     msg: {
                         let msg = root
@@ -819,13 +848,98 @@ mod tests {
         m.apply(
             Event::StatusRemoved {
                 block: "block:a".into(),
-                id: String::new(),
+                ids: vec![String::new()],
             },
             600,
         );
         let row = &m.rows(600)[0];
         assert_eq!(row.state, "starting");
         assert_eq!(row.age, None);
+    }
+
+    fn removed(block: &str, id: &str) -> Event {
+        Event::StatusRemoved {
+            block: block.into(),
+            ids: vec![id.into()],
+        }
+    }
+
+    /// A worker whose root went idle at 100 with a subagent `sub` working.
+    fn idle_with_a_working_subagent() -> Model {
+        let mut m = Model::new(LEAD.into(), None, 0);
+        m.apply(meta("block:a", LEAD, None), 0);
+        m.apply(status("block:a", "", "claude-code", "working", None), 0);
+        m.apply(status("block:a", "sub", "claude-code", "working", None), 50);
+        m.apply(status("block:a", "", "claude-code", "idle", None), 100);
+        m
+    }
+
+    #[test]
+    fn an_idle_root_with_a_working_subagent_is_working() {
+        let m = idle_with_a_working_subagent();
+        let row = &m.rows(300)[0];
+        assert_eq!(row.state, "working");
+        // Working since the root started; it never stopped.
+        assert_eq!(row.age, Some(300));
+    }
+
+    #[test]
+    fn the_idle_time_starts_when_the_last_subagent_finishes() {
+        let mut m = idle_with_a_working_subagent();
+        m.apply(
+            status("block:a", "sub2", "claude-code", "working", None),
+            150,
+        );
+        m.apply(removed("block:a", "sub"), 200);
+        assert_eq!(m.rows(250)[0].state, "working");
+        m.apply(removed("block:a", "sub2"), 400);
+        let row = &m.rows(460)[0];
+        assert_eq!(row.state, "idle");
+        assert_eq!(row.age, Some(60));
+    }
+
+    #[test]
+    fn a_done_root_with_a_blocked_subagent_is_blocked() {
+        let mut m = Model::new(LEAD.into(), None, 0);
+        m.apply(meta("block:a", LEAD, None), 0);
+        m.apply(status("block:a", "", "claude-code", "done", None), 0);
+        m.apply(status("block:a", "sub", "claude-code", "working", None), 10);
+        m.apply(
+            status("block:a", "sub2", "claude-code", "blocked", None),
+            20,
+        );
+        let row = &m.rows(30)[0];
+        assert_eq!(row.state, "blocked");
+        assert_eq!(row.age, Some(10));
+    }
+
+    #[test]
+    fn the_roots_own_state_wins_over_its_subagents() {
+        let mut m = Model::new(LEAD.into(), None, 0);
+        m.apply(meta("block:a", LEAD, None), 0);
+        m.apply(status("block:a", "", "claude-code", "working", None), 0);
+        m.apply(status("block:a", "sub", "claude-code", "blocked", None), 10);
+        let row = &m.rows(30)[0];
+        assert_eq!(row.state, "working");
+        assert_eq!(row.age, Some(30));
+        m.apply(status("block:a", "", "claude-code", "error", None), 40);
+        assert_eq!(m.rows(50)[0].state, "error");
+    }
+
+    #[test]
+    fn only_subagents_of_the_roots_app_count() {
+        let mut m = Model::new(LEAD.into(), None, 0);
+        // The meta record is `idle`; give it `working` to show it never counts.
+        let msg = json!({ "lead": LEAD }).to_string();
+        m.apply(
+            status("block:a", "meta", "rexlead", "working", Some(&msg)),
+            0,
+        );
+        m.apply(status("block:a", "", "claude-code", "idle", None), 0);
+        m.apply(status("block:a", "x", "other-app", "working", None), 10);
+        let row = &m.rows(30)[0];
+        assert_eq!(row.state, "idle");
+        assert_eq!(row.age, Some(30));
     }
 
     #[test]
