@@ -27,8 +27,9 @@ pub fn roster_label(lead: &str) -> String {
 }
 
 /// The lock that `open` holds while it checks for the roster and creates
-/// it, `spawn` while it pins and starts a worker, and the roster while it
-/// decides to exit and leaves. It sits next to the pin file and is named
+/// it, `spawn` while it pins and starts a worker, `pin` while it changes the
+/// pin and renames the session, and the roster while it decides to exit and
+/// leaves. It sits next to the pin file and is named
 /// after it, because the roster is handed the pin file's path and runs in an
 /// environment that may name a different lock directory or server.
 pub fn open_lock(pin: &Path) -> std::path::PathBuf {
