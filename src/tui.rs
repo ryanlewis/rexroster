@@ -860,18 +860,23 @@ impl App<'_> {
             }
         };
         self.width = inner.width;
+        // With no border the control sits on the first line, so that line
+        // is cut short to leave it room, with a space before it.
+        let reset = reset.filter(|_| self.opts.border == Border::None);
+        let mut reserve = 0;
+        if let Some(reset) = reset {
+            let w = u16::try_from(reset.width()).unwrap_or(0);
+            self.reset_area = right_end(area, w, 0);
+            reserve = self.reset_area.width + u16::from(self.reset_area.width > 0);
+        }
         if self.panel.is_some() {
             self.draw_panel(f, inner);
         } else {
             let footer =
                 (self.opts.border == Border::None && self.footer_shown()).then_some(footer);
-            self.draw_list(f, inner, rows, footer);
+            self.draw_list(f, inner, rows, footer, reserve);
         }
-        if self.opts.border == Border::None
-            && let Some(reset) = reset
-        {
-            let w = u16::try_from(reset.width()).unwrap_or(0);
-            self.reset_area = right_end(area, w, 0);
+        if let Some(reset) = reset {
             f.render_widget(Line::styled(reset, gray), self.reset_area);
         }
     }
@@ -931,6 +936,7 @@ impl App<'_> {
         area: Rect,
         rows: &[Row],
         footer: Option<Line>,
+        reserve: u16,
     ) {
         let footer_rows = u16::from(footer.is_some() && area.height > 0);
         let list = Rect {
@@ -959,13 +965,29 @@ impl App<'_> {
         });
         self.offset = end.saturating_sub(visible).min(start);
         self.line_owner = laid.iter().map(|(o, _)| *o).collect();
-        let lines: Vec<Line> = laid
+        let mut lines: Vec<Line> = laid
             .into_iter()
             .skip(self.offset)
             .take(visible)
             .map(|(_, l)| l)
             .collect();
-        f.render_widget(Paragraph::new(lines), list);
+        // The first line gives up its right `reserve` columns.
+        if reserve > 0 && !lines.is_empty() {
+            let first = Rect {
+                width: list.width.saturating_sub(reserve),
+                height: 1,
+                ..list
+            };
+            f.render_widget(Paragraph::new(lines.remove(0)), first);
+            let rest = Rect {
+                y: list.y + 1,
+                height: list.height - 1,
+                ..list
+            };
+            f.render_widget(Paragraph::new(lines), rest);
+        } else {
+            f.render_widget(Paragraph::new(lines), list);
+        }
         if let Some(line) = footer.filter(|_| footer_rows == 1) {
             let at = Rect {
                 y: area.bottom() - 1,
@@ -2203,6 +2225,47 @@ mod tests {
             let screen = render(&mut a, &rows);
             assert!(!screen.contains('↺'), "{screen}");
         }
+    }
+
+    #[test]
+    fn the_reset_control_never_covers_row_text() {
+        let long = "a-very-long-worker-label-that-runs-on";
+        let rows = [row("block:1", long, "idle", false)];
+        for width in [20, 26] {
+            let rex = Fake::default();
+            let mut a = following(&rex);
+            let before = render_at(&mut a, &rows, width, 5);
+            rex.on("session.view", laid_out(FULL, [0.3, 0.4, 0.27, 0.12]));
+            view_pass(&mut a);
+            let after = render_at(&mut a, &rows, width, 5);
+            let reset = if width >= 40 { RESET } else { RESET_SHORT };
+            let keep = usize::from(width) - reset.width() - 1;
+            let top: String = before.lines().next().unwrap().chars().take(keep).collect();
+            assert_eq!(
+                after.lines().next().unwrap(),
+                format!("{top} {reset}"),
+                "{after}"
+            );
+            // The lines below, and how many there are, don't change.
+            assert_eq!(
+                after.lines().skip(1).collect::<Vec<_>>(),
+                before.lines().skip(1).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn with_a_border_the_reset_control_leaves_the_first_row_whole() {
+        let rows = [row("block:1", "a-very-long-worker-label", "idle", false)];
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        a.opts.border = Border::Rounded;
+        let before = render_at(&mut a, &rows, 26, 5);
+        rex.on("session.view", laid_out(FULL, [0.3, 0.4, 0.27, 0.12]));
+        view_pass(&mut a);
+        let after = render_at(&mut a, &rows, 26, 5);
+        assert!(after.contains('↺'), "{after}");
+        assert_eq!(after.lines().nth(1), before.lines().nth(1), "{after}");
     }
 
     #[test]
