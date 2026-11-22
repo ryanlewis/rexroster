@@ -126,4 +126,163 @@ mod tests {
         run(rex, Notify::None, &path).unwrap();
         assert!(!start(Path::new("/nonexistent/rexroster"), &path).unwrap());
     }
+
+    /// Events, as `rex events --json` lines, and what the watcher does with
+    /// each: "float", "sink" or "ignore". The first lines were captured from
+    /// Rex (testdata/program-status.jsonl); the rest are shapes src/events.rs
+    /// reads that Rex has not been seen to send.
+    fn parity_cases() -> Vec<(String, &'static str)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/program-status.jsonl");
+        let captured = std::fs::read_to_string(path).unwrap();
+        let expected = [
+            "float",  // root blocked
+            "sink",   // root cleared: ids [""]
+            "ignore", // subagent set
+            "ignore", // subagent cleared: ids ["sub"]
+            "float",  // root blocked
+            "ignore", // subagent set
+            "sink",   // everything cleared: ids ["", "a"]
+            "sink",   // root working
+            "sink",   // program exited: ids [""], reason child_exited
+            "sink",   // block closed
+        ];
+        let captured: Vec<_> = captured.lines().map(str::to_owned).collect();
+        assert_eq!(captured.len(), expected.len());
+        let status = |name: &str, payload: &str| {
+            format!(
+                r#"{{"type":"session_event","payload":{{"session_id":"session:test","event":{{"type":"block_event","payload":{{"block_id":"block:w1","name":"{name}","payload":{payload}}}}}}}}}"#
+            )
+        };
+        let defensive = [
+            (status("program_status_cleared", r#"{"ids":[""]}"#), "sink"),
+            (status("program_status_cleared", "{}"), "sink"),
+            (
+                status("program_status_cleared", r#"{"ids":["a"]}"#),
+                "ignore",
+            ),
+            (status("program_status_removed", "{}"), "sink"),
+            (
+                status("program_status_changed", r#"{"id":"","record":null}"#),
+                "sink",
+            ),
+            (
+                status("program_status_changed", r#"{"record":null}"#),
+                "sink",
+            ),
+            (
+                status("program_status_changed", r#"{"id":"meta","record":null}"#),
+                "ignore",
+            ),
+            (
+                status("program_status_changed", r#"{"id":"","record":{}}"#),
+                "sink",
+            ),
+        ];
+        captured
+            .into_iter()
+            .zip(expected)
+            .chain(defensive)
+            .collect()
+    }
+
+    /// The watcher's rule, applied to what src/events.rs makes of a line: it
+    /// acts only on the root record (id ""), and a removal sinks the block
+    /// only if it names the root.
+    fn watcher_action(line: &str) -> &'static str {
+        match crate::events::parse(line) {
+            Some(Event::Status { id, record, .. }) if id.is_empty() => {
+                if record.state == "blocked" {
+                    "float"
+                } else {
+                    "sink"
+                }
+            }
+            Some(Event::StatusRemoved { ids, .. }) if ids.iter().any(String::is_empty) => "sink",
+            Some(Event::BlockClosed(_)) => "sink",
+            _ => "ignore",
+        }
+    }
+
+    use crate::events::Event;
+
+    #[test]
+    fn events_rs_and_the_watcher_agree_on_status_events() {
+        for (line, want) in parity_cases() {
+            assert_eq!(watcher_action(&line), want, "{line}");
+        }
+    }
+
+    /// Runs the real Lua through `rex do -e`, with the rex API stubbed, over
+    /// the same cases. Each case runs once from rest (does it float?) and once
+    /// after a float (does it sink?).
+    #[test]
+    #[ignore = "needs rex and a running Rex server: cargo test -- --ignored"]
+    fn the_lua_watcher_agrees_with_events_rs() {
+        let cases = parity_cases();
+        let lines: Vec<_> = cases.iter().map(|(l, _)| l.as_str()).collect();
+        let lines = serde_json::to_string(&lines).unwrap();
+        assert!(!lines.contains("]==]"));
+        let lua = format!(
+            r#"
+local real, real_print = rex, print
+local handlers, log = {{}}, {{}}
+local function ok() return {{}} end
+rex = setmetatable({{
+  on = function(name, f) handlers[name] = f end,
+  log = function() end,
+  session = {{
+    describe_block = function() return {{ block = {{ placement = "detached", label = "w" }} }} end,
+    view = function()
+      return {{ active_window_id = "w", windows = {{ {{ window_id = "w",
+        layers = {{ {{ kind = "tiled", blocks = {{ {{ block_id = "anchor" }} }} }} }} }} }} }}
+    end,
+    move_block = ok, float_block = ok, detach_block = ok,
+  }},
+}}, {{ __index = real }})
+print = function(s) log[#log + 1] = s end
+{script}
+local out = {{}}
+for _, line in ipairs(rex.json.decode([==[{lines}]==])) do
+  local e = rex.json.decode(line).payload.event
+  local ctx = {{ session_id = "session:test", block_id = e.payload.block_id }}
+  local name, ev = e.type, e.payload
+  if name == "block_event" then name, ev = "terminal." .. e.payload.name, e.payload.payload end
+  local function after(floated)
+    handlers.block_closed(ctx, {{ block_id = ctx.block_id }})
+    if floated then
+      handlers["terminal.program_status_changed"](ctx, {{ id = "", record = {{ state = "blocked" }} }})
+    end
+    log = {{}}
+    if handlers[name] then handlers[name](ctx, ev) end
+    return log[1] or ""
+  end
+  local action = "ignore"
+  if after(false):find("^floated") then action = "float"
+  elseif after(true):find("^sank") then action = "sink" end
+  out[#out + 1] = action
+end
+real_print("PARITY " .. rex.json.encode(out))
+"#,
+            script = script(Notify::None),
+        );
+        let out = Command::new("rex")
+            .args(["do", "-e", &lua])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("PARITY "))
+            .unwrap_or_else(|| panic!("no result in {stdout}"));
+        let got: Vec<String> = serde_json::from_str(got).unwrap();
+        for ((line, want), got) in cases.iter().zip(&got) {
+            assert_eq!(got, want, "{line}");
+        }
+        assert_eq!(got.len(), cases.len());
+    }
 }
