@@ -96,7 +96,7 @@ A line of key hints shows at the bottom while the roster has focus. With a borde
 
 To hide a shown worker, press `Enter` on it or minimize its pane: the roster turns a minimized worker back into a hidden one. Closing a worker's pane ends the worker.
 
-The roster's layer sits at the top right of the lead's pane, and moves with it when the layout changes: a split forms, a pane closes or is resized. When the lead is zoomed, the roster sits at the top right of the window. When the lead floats, is in another window, or has another pane zoomed over it, the roster stays where it is. Once you drag the roster somewhere else, it stays there and shows `↺ reset` at its top right; click it or press `r` to send it back. Resizing the roster from any corner but its top right doesn't count as a drag.
+The roster's layer sits at the top right of the lead's pane, and moves with it when the layout changes: a split forms, a pane closes or is resized. When the lead is zoomed, the roster sits at the top right of the window. When the lead floats, is in another window, or has another pane zoomed over it, the roster stays where it is. Once you drag the roster somewhere else, it stays there and shows `↺ reset` at its top right; click it or press `r` to send it back. Resizing it by its left or bottom edge, or its bottom left corner, keeps it following; moving its top or right edge counts as a drag.
 
 The layer's height follows the lines the workers take, plus the hints line while focused, up to 60% of the window's height. If the roster's pane is narrower than 50 columns, the roster widens it to 50, growing to the left so it stays in the corner. It never narrows a pane you have widened. If the roster never gets a worker, it exits after 30 seconds.
 

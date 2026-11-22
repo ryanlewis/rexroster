@@ -537,8 +537,9 @@ impl App<'_> {
         }
         if sized {
             self.fit.attempts += 1;
+            // Only a new size resizes the terminal; a move alone doesn't.
+            self.fit.last_resize = Some(Instant::now());
         }
-        self.fit.last_resize = Some(Instant::now());
         let res = self.rex.call(
             "session.resize_layer",
             json!({
@@ -2077,6 +2078,19 @@ mod tests {
         view_pass(&mut a);
         let moved = resized(&rex, 1);
         assert!(close(moved, [0.22, 0.02, 0.27, 0.12]), "{moved:?}");
+    }
+
+    #[test]
+    fn a_move_alone_leaves_the_next_terminal_resize_to_the_user() {
+        let rex = Fake::default();
+        let mut a = following(&rex);
+        a.fit.attempts = MAX_FITS;
+        rex.on("session.view", laid_out(LEFT_HALF, START));
+        view_pass(&mut a);
+        assert_eq!(rex.params("session.resize_layer").len(), 1);
+        // Moving doesn't resize the terminal, so this one is the user's.
+        a.on_terminal_event(&TermEvent::Resize(60, 5), &[]);
+        assert_eq!(a.fit.attempts, 0);
     }
 
     #[test]
