@@ -8,7 +8,9 @@
 //! (with its report's first line, when one was written this turn), a worker
 //! blocked or in error, a new worker ready for its brief, a worker's program
 //! exited, a worker's block closed.
-//! Starting work is silent.
+//! Starting work is silent, and a stop waits until it has lasted `SETTLE`
+//! seconds. With a reports dir, the tracker's state is kept there so a
+//! restart picks up where the last run stopped.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -17,19 +19,41 @@ use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde_json::{Value, json};
 
 use crate::events::{self, Event};
 use crate::model::{Model, Row};
 use crate::rex;
 
+/// How long a worker has to stay stopped before its stop is printed: a
+/// worker's root record goes idle for a moment while its subagents start and
+/// finish, and each of those would otherwise wake the lead.
+const SETTLE: u64 = 10;
+
+/// The file in the reports dir that keeps the tracker's state across
+/// restarts of `rexroster events`.
+const STATE_FILE: &str = ".rexroster-events.json";
+
 /// What the lead last knew about a worker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Seen {
     label: String,
     state: String,
     /// When its current turn started, in Unix seconds: reports older than
     /// this belong to an earlier turn.
     turn: u64,
+    /// When its current stop started.
+    since: u64,
+    /// Whether its current stop was printed. A stop not yet printed is held.
+    printed: bool,
+    /// Whether its current stop is a new worker's first: worded `ready`.
+    ready: bool,
+}
+
+impl Seen {
+    fn held(&self) -> bool {
+        stopped(&self.state) && !self.printed
+    }
 }
 
 /// Diffs the model's rows into lines.
@@ -37,6 +61,8 @@ struct Seen {
 pub struct Tracker {
     seen: HashMap<String, Seen>,
     primed: bool,
+    /// Loaded from a state file and not yet diffed.
+    restored: bool,
 }
 
 fn stopped(state: &str) -> bool {
@@ -44,35 +70,119 @@ fn stopped(state: &str) -> bool {
 }
 
 impl Tracker {
-    /// The lines for the change from the last call to `rows`. The first call
-    /// only records where every worker stands, except that a worker already
-    /// blocked or in error is reported: a lead that restarts its monitor
-    /// still hears about it.
+    /// The tracker the last run left in `path`, so a restart diffs against
+    /// what it knew. A missing or unreadable file is a fresh start.
+    pub fn load(path: &Path) -> Tracker {
+        let seen = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| {
+                v.as_object()?
+                    .iter()
+                    .map(|(block, w)| {
+                        let s = |k: &str| w.get(k)?.as_str().map(str::to_owned);
+                        let n = |k: &str| w.get(k)?.as_u64();
+                        let b = |k: &str| w.get(k)?.as_bool();
+                        let seen = Seen {
+                            label: s("label")?,
+                            state: s("state")?,
+                            turn: n("turn")?,
+                            since: n("since")?,
+                            printed: b("printed")?,
+                            ready: b("ready")?,
+                        };
+                        Some((block.clone(), seen))
+                    })
+                    .collect::<Option<HashMap<_, _>>>()
+            });
+        match seen {
+            Some(seen) => Tracker {
+                seen,
+                primed: true,
+                restored: true,
+            },
+            None => Tracker::default(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let map: serde_json::Map<String, Value> = self
+            .seen
+            .iter()
+            .map(|(block, w)| {
+                let v = json!({
+                    "label": w.label,
+                    "state": w.state,
+                    "turn": w.turn,
+                    "since": w.since,
+                    "printed": w.printed,
+                    "ready": w.ready,
+                });
+                (block.clone(), v)
+            })
+            .collect();
+        Value::Object(map).to_string()
+    }
+
+    /// Write the tracker to `path`, replacing it whole.
+    fn save(path: &Path, json: &str) -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// The lines for the change from the last call to `rows`. A fresh
+    /// tracker's first call only records where every worker stands, except
+    /// that a worker already blocked or in error is reported. A stop is held
+    /// until the worker has stayed stopped for `SETTLE` seconds; working
+    /// again within that drops it.
     pub fn diff(&mut self, rows: &[Row], now: u64, reports: Option<&Path>) -> Vec<String> {
         let mut out = Vec::new();
-        let first = !self.primed;
+        let fresh = !self.primed;
+        let restored = std::mem::take(&mut self.restored);
         self.primed = true;
         for row in rows {
             let prev = self.seen.get(&row.block).cloned();
-            let mut turn = prev.as_ref().map_or(now, |p| p.turn);
-            let changed = prev.as_ref().is_none_or(|p| p.state != row.state);
-            if changed {
-                let was = prev.as_ref().map(|p| p.state.as_str());
-                if row.state == "working" && !was.is_some_and(|w| w == "blocked") {
-                    turn = now;
+            let was = prev.as_ref().map(|p| p.state.clone());
+            let mut w = prev.unwrap_or(Seen {
+                label: row.label.clone(),
+                state: String::new(),
+                turn: now,
+                since: now,
+                printed: true,
+                ready: false,
+            });
+            w.label.clone_from(&row.label);
+            if was.as_deref() != Some(row.state.as_str()) {
+                if stopped(&row.state) {
+                    if !was.as_deref().is_some_and(stopped) {
+                        // A fresh start already knows nothing to report.
+                        w.since = now;
+                        w.printed = fresh;
+                        w.ready = was.as_deref().is_none_or(|s| s == "starting");
+                    }
+                } else {
+                    let held = was.is_some() && w.held();
+                    match row.state.as_str() {
+                        // Back to work within the settle: the same turn.
+                        "working" | "blocked" | "error" if held => {}
+                        "working" if was.as_deref() != Some("blocked") => w.turn = now,
+                        // The program ended: its stop stands.
+                        _ if held => out.push(stop_line(&w, reports)),
+                        _ => {}
+                    }
+                    w.printed = true;
+                    if let Some(line) = word(row, was.as_deref(), fresh) {
+                        out.push(line);
+                    }
                 }
-                if let Some(line) = word(row, was, first, turn, reports) {
-                    out.push(line);
-                }
+                w.state.clone_from(&row.state);
             }
-            self.seen.insert(
-                row.block.clone(),
-                Seen {
-                    label: row.label.clone(),
-                    state: row.state.clone(),
-                    turn,
-                },
-            );
+            if w.held() && now.saturating_sub(w.since) >= SETTLE {
+                out.push(stop_line(&w, reports));
+                w.printed = true;
+            }
+            self.seen.insert(row.block.clone(), w);
         }
         let live: Vec<&str> = rows.iter().map(|r| r.block.as_str()).collect();
         let mut gone: Vec<String> = self
@@ -83,37 +193,46 @@ impl Tracker {
             .collect();
         gone.sort();
         for block in gone {
-            let seen = self.seen.remove(&block).expect("listed above");
-            out.push(format!("{} closed", seen.label));
+            let w = self.seen.remove(&block).expect("listed above");
+            if w.held() {
+                out.push(stop_line(&w, reports));
+            }
+            // A worker that closed while no watcher ran may have reported.
+            let report = (restored && w.state == "working")
+                .then(|| reports.and_then(|dir| report_line(dir, &w.label, w.turn)))
+                .flatten();
+            out.push(match report {
+                Some(report) => format!("{} closed: {report}", w.label),
+                None => format!("{} closed", w.label),
+            });
         }
         out
     }
 }
 
-/// The line for one worker's change of state, if the lead needs one.
-fn word(
-    row: &Row,
-    was: Option<&str>,
-    first: bool,
-    turn: u64,
-    reports: Option<&Path>,
-) -> Option<String> {
+/// The line for a held stop.
+fn stop_line(w: &Seen, reports: Option<&Path>) -> String {
+    let name = &w.label;
+    if w.ready {
+        return format!("{name} ready");
+    }
+    let s = &w.state;
+    match reports {
+        Some(dir) => {
+            let report = report_line(dir, name, w.turn);
+            format!("{name} {s}: {}", report.as_deref().unwrap_or("no report"))
+        }
+        None => format!("{name} {s}"),
+    }
+}
+
+/// The line for a worker leaving a stop or its start, if the lead needs one
+/// at once.
+fn word(row: &Row, was: Option<&str>, fresh: bool) -> Option<String> {
     let name = &row.label;
     match row.state.as_str() {
         "blocked" | "error" => Some(format!("{name} {}: {}", row.state, row.msg)),
-        _ if first => None,
-        // A new worker reaching its prompt is ready for a brief.
-        s if stopped(s) && was.is_none_or(|w| w == "starting") => Some(format!("{name} ready")),
-        // A switch between idle and done is not a new stop.
-        s if stopped(s) => {
-            if was.is_some_and(stopped) {
-                return None;
-            }
-            Some(match reports {
-                Some(dir) => format!("{name} {s}: {}", report_line(dir, name, turn)),
-                None => format!("{name} {s}"),
-            })
-        }
+        _ if fresh => None,
         // The root record went away: the worker's program exited, its block
         // stayed open.
         "starting" if was.is_some_and(|w| w != "starting") => Some(format!("{name} exited")),
@@ -122,8 +241,8 @@ fn word(
 }
 
 /// The first line and path of the newest `<dir>/<name>#*.md` written at or
-/// after `turn`, or `no report`.
-fn report_line(dir: &Path, name: &str, turn: u64) -> String {
+/// after `turn`, if there is one.
+fn report_line(dir: &Path, name: &str, turn: u64) -> Option<String> {
     let prefix = format!("{name}#");
     let newest = std::fs::read_dir(dir)
         .into_iter()
@@ -139,14 +258,12 @@ fn report_line(dir: &Path, name: &str, turn: u64) -> String {
             (secs >= turn).then_some((secs, e.path()))
         })
         .max();
-    let Some((_, path)) = newest else {
-        return "no report".to_owned();
-    };
+    let (_, path) = newest?;
     let first = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| t.lines().next().map(str::to_owned))
         .unwrap_or_default();
-    format!("{first} ({})", path.display())
+    Some(format!("{first} ({})", path.display()))
 }
 
 fn now() -> u64 {
@@ -194,38 +311,48 @@ fn follow(
 ) -> Result<()> {
     let me = std::env::var("REX_BLOCK").ok().filter(|s| !s.is_empty());
     let mut model = Model::new(lead, me, now());
-    let mut tracker = Tracker::default();
+    let state = reports.map(|dir| dir.join(STATE_FILE));
+    let mut tracker = state.as_deref().map(Tracker::load).unwrap_or_default();
+    let mut saved = String::new();
     model.refresh(cli, session, now())?;
     let mut out = std::io::stdout().lock();
-    let mut emit = |lines: Vec<String>| -> Result<()> {
-        for line in lines {
+    let mut step = |tracker: &mut Tracker, model: &Model| -> Result<()> {
+        for line in tracker.diff(&model.rows(now()), now(), reports) {
             writeln!(out, "{line}")?;
         }
         out.flush()?;
+        if let Some(path) = &state {
+            let json = tracker.to_json();
+            // The state is a convenience for the next run: a failed write
+            // must not stop this one.
+            if json != saved && Tracker::save(path, &json).is_ok() {
+                saved = json;
+            }
+        }
         Ok(())
     };
-    emit(tracker.diff(&model.rows(now()), now(), reports))?;
+    step(&mut tracker, &model)?;
     loop {
         if model.should_exit(now()) {
             return Ok(());
         }
         let event = match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Some(event)) => event,
+            Ok(Some(event)) => Some(event),
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                emit(vec![
-                    "rexroster events: the rex event stream ended".to_owned(),
-                ])?;
+                println!("rexroster events: the rex event stream ended");
                 anyhow::bail!("the rex event stream ended");
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            // A quiet second still lets a held stop settle.
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
         };
-        let needs = model.apply(event, now());
-        if needs.blocks {
+        if let Some(event) = event
+            && model.apply(event, now()).blocks
+        {
             // A failed listing leaves the rows as they were; the next
             // structural event tries again.
             let _ = model.refresh(cli, session, now());
         }
-        emit(tracker.diff(&model.rows(now()), now(), reports))?;
+        step(&mut tracker, &model)?;
     }
 }
 
@@ -262,9 +389,11 @@ mod tests {
         t.diff(&[row("a", "idle", "")], 10, None);
         assert!(t.diff(&[row("a", "working", "ls")], 11, None).is_empty());
         assert!(t.diff(&[row("a", "working", "date")], 12, None).is_empty());
-        assert_eq!(t.diff(&[row("a", "done", "")], 13, None), ["w-a done"]);
+        assert!(t.diff(&[row("a", "done", "")], 13, None).is_empty());
         // done then idle is the same stop
         assert!(t.diff(&[row("a", "idle", "")], 14, None).is_empty());
+        assert_eq!(t.diff(&[row("a", "idle", "")], 23, None), ["w-a idle"]);
+        assert!(t.diff(&[row("a", "idle", "")], 40, None).is_empty());
     }
 
     #[test]
@@ -294,7 +423,8 @@ mod tests {
         let mut t = Tracker::default();
         t.diff(&[], 10, None);
         assert!(t.diff(&[row("a", "starting", "")], 11, None).is_empty());
-        assert_eq!(t.diff(&[row("a", "idle", "")], 12, None), ["w-a ready"]);
+        assert!(t.diff(&[row("a", "idle", "")], 12, None).is_empty());
+        assert_eq!(t.diff(&[row("a", "idle", "")], 22, None), ["w-a ready"]);
     }
 
     fn reports_dir(name: &str) -> PathBuf {
@@ -327,8 +457,9 @@ mod tests {
         t.diff(&[row("a", "working", "")], turn, Some(&dir));
         let path = dir.join("w-a#1.md");
         std::fs::write(&path, "w-a#1 succeeded\nremaining: nothing\n").unwrap();
+        t.diff(&[row("a", "done", "")], turn, Some(&dir));
         assert_eq!(
-            t.diff(&[row("a", "done", "")], turn, Some(&dir)),
+            t.diff(&[row("a", "done", "")], turn + SETTLE, Some(&dir)),
             [format!("w-a done: w-a#1 succeeded ({})", path.display())]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -342,8 +473,9 @@ mod tests {
         t.diff(&[row("a", "idle", "")], 0, Some(&dir));
         let later = now() + 60;
         t.diff(&[row("a", "working", "")], later, Some(&dir));
+        t.diff(&[row("a", "idle", "")], later, Some(&dir));
         assert_eq!(
-            t.diff(&[row("a", "idle", "")], later, Some(&dir)),
+            t.diff(&[row("a", "idle", "")], later + SETTLE, Some(&dir)),
             ["w-a idle: no report"]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -359,11 +491,143 @@ mod tests {
         std::fs::write(dir.join("w-a#1.md"), "w-a#1 failed\n").unwrap();
         t.diff(&[row("a", "blocked", "")], turn + 100, Some(&dir));
         t.diff(&[row("a", "working", "")], turn + 200, Some(&dir));
-        let lines = t.diff(&[row("a", "done", "")], turn + 300, Some(&dir));
+        t.diff(&[row("a", "done", "")], turn + 300, Some(&dir));
+        let lines = t.diff(&[row("a", "done", "")], turn + 300 + SETTLE, Some(&dir));
         assert!(
             lines[0].starts_with("w-a done: w-a#1 failed ("),
             "{lines:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_is_dropped_when_work_resumes_within_the_settle() {
+        let mut t = Tracker::default();
+        t.diff(&[row("a", "working", "")], 10, None);
+        assert!(t.diff(&[row("a", "idle", "")], 11, None).is_empty());
+        assert!(t.diff(&[row("a", "working", "")], 20, None).is_empty());
+        assert!(t.diff(&[row("a", "working", "")], 40, None).is_empty());
+        // a later stop settles from its own start
+        assert!(t.diff(&[row("a", "done", "")], 41, None).is_empty());
+        assert!(t.diff(&[row("a", "done", "")], 50, None).is_empty());
+        assert_eq!(t.diff(&[row("a", "done", "")], 51, None), ["w-a done"]);
+    }
+
+    #[test]
+    fn a_dropped_stop_keeps_its_turn() {
+        let dir = reports_dir("dropped");
+        let mut t = Tracker::default();
+        t.diff(&[row("a", "idle", "")], 0, Some(&dir));
+        let turn = now();
+        t.diff(&[row("a", "working", "")], turn, Some(&dir));
+        std::fs::write(dir.join("w-a#1.md"), "w-a#1 succeeded\n").unwrap();
+        t.diff(&[row("a", "idle", "")], turn + 100, Some(&dir));
+        t.diff(&[row("a", "working", "")], turn + 105, Some(&dir));
+        t.diff(&[row("a", "done", "")], turn + 200, Some(&dir));
+        let lines = t.diff(&[row("a", "done", "")], turn + 200 + SETTLE, Some(&dir));
+        assert!(
+            lines[0].starts_with("w-a done: w-a#1 succeeded ("),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_stop_is_printed_before_closed() {
+        let mut t = Tracker::default();
+        t.diff(&[row("a", "working", "")], 10, None);
+        assert!(t.diff(&[row("a", "done", "")], 11, None).is_empty());
+        assert_eq!(t.diff(&[], 12, None), ["w-a done", "w-a closed"]);
+    }
+
+    fn restart(t: &Tracker, dir: &Path) -> Tracker {
+        let path = dir.join(STATE_FILE);
+        Tracker::save(&path, &t.to_json()).unwrap();
+        Tracker::load(&path)
+    }
+
+    #[test]
+    fn a_restart_prints_a_gap_stop_and_a_gap_close() {
+        let dir = reports_dir("gap");
+        let mut t = Tracker::default();
+        t.diff(&[row("a", "idle", ""), row("b", "idle", "")], 0, Some(&dir));
+        let turn = now();
+        t.diff(
+            &[row("a", "working", ""), row("b", "working", "")],
+            turn,
+            Some(&dir),
+        );
+        let path = dir.join("w-b#1.md");
+        std::fs::write(&path, "w-b#1 succeeded\n").unwrap();
+        // no watcher runs while a stops and b closes
+        let mut t = restart(&t, &dir);
+        let later = turn + 1800;
+        assert_eq!(
+            t.diff(&[row("a", "done", "")], later, Some(&dir)),
+            [format!("w-b closed: w-b#1 succeeded ({})", path.display())]
+        );
+        assert_eq!(
+            t.diff(&[row("a", "done", "")], later + SETTLE, Some(&dir)),
+            ["w-a done: no report"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_does_not_repeat_a_printed_stop() {
+        let dir = reports_dir("repeat");
+        let mut t = Tracker::default();
+        t.diff(&[row("a", "working", "")], 10, Some(&dir));
+        t.diff(&[row("a", "done", "")], 11, Some(&dir));
+        assert_eq!(t.diff(&[row("a", "done", "")], 21, Some(&dir)).len(), 1);
+        let mut t = restart(&t, &dir);
+        assert!(t.diff(&[row("a", "done", "")], 30, Some(&dir)).is_empty());
+        assert!(t.diff(&[row("a", "done", "")], 60, Some(&dir)).is_empty());
+        assert_eq!(t.diff(&[], 61, Some(&dir)), ["w-a closed"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_carries_the_turn_start() {
+        let dir = reports_dir("carry");
+        let mut t = Tracker::default();
+        t.diff(&[row("a", "idle", "")], 0, Some(&dir));
+        let turn = now();
+        t.diff(&[row("a", "working", "")], turn, Some(&dir));
+        let path = dir.join("w-a#1.md");
+        std::fs::write(&path, "w-a#1 succeeded\n").unwrap();
+        let mut t = restart(&t, &dir);
+        let later = turn + 60;
+        assert!(
+            t.diff(&[row("a", "working", "")], later, Some(&dir))
+                .is_empty()
+        );
+        t.diff(&[row("a", "done", "")], later, Some(&dir));
+        assert_eq!(
+            t.diff(&[row("a", "done", "")], later + SETTLE, Some(&dir)),
+            [format!("w-a done: w-a#1 succeeded ({})", path.display())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_state_file_is_a_fresh_start() {
+        let dir = reports_dir("fresh");
+        let path = dir.join(STATE_FILE);
+        let missing = Tracker::load(&path);
+        std::fs::write(&path, "not json").unwrap();
+        for mut t in [missing, Tracker::load(&path)] {
+            assert_eq!(
+                t.diff(
+                    &[row("a", "done", ""), row("b", "blocked", "Allow?")],
+                    10,
+                    Some(&dir)
+                ),
+                ["w-b blocked: Allow?"]
+            );
+            let rows = [row("a", "done", ""), row("b", "blocked", "Allow?")];
+            assert!(t.diff(&rows, 30, Some(&dir)).is_empty());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
