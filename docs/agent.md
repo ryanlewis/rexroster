@@ -166,11 +166,11 @@ turn wakes you once. Start it after your first `spawn`; it exits by itself,
 status 0, once you have no workers left. A line `rexroster events: the rex
 event stream ended` and status 1 means the Rex server went away. A stop line
 waits until the worker has stayed stopped for 10 s, so a subagent starting or
-finishing does not wake you. A worker already blocked when it starts is
-reported straight away. With `--reports`, it keeps what it knew in
+finishing does not wake you. With `--reports`, it keeps what it knew in
 `<dir>/.rexroster-events.json`, so after a restart (say, a monitor timeout) it
-prints the stops and closes it missed, once, and repeats none. Without
-`--reports`, a restart reports only workers blocked or in error.
+prints the stops and closes it missed, once, and repeats no line it already
+printed, a worker still blocked included. Without `--reports`, a restart
+reports only the workers already blocked or in error.
 
 ## The watcher
 

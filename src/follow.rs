@@ -339,7 +339,10 @@ fn follow(
         let event = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Some(event)) => Some(event),
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                println!("rexroster events: the rex event stream ended");
+                writeln!(
+                    std::io::stdout(),
+                    "rexroster events: the rex event stream ended"
+                )?;
                 anyhow::bail!("the rex event stream ended");
             }
             // A quiet second still lets a held stop settle.
