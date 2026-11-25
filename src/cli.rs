@@ -107,6 +107,18 @@ pub enum Command {
     /// sink them when they move on. One runs per user per Rex server; open
     /// and spawn start it.
     Watch,
+    /// Print one line per change in a lead's workers that the lead must act
+    /// on: ready, stopped (with this turn's report), blocked, error, exited,
+    /// closed. Starting work prints nothing. For an agent's background
+    /// monitor; exits once the lead has no workers left.
+    Events {
+        /// The lead's block id.
+        lead: String,
+        /// Where workers write `<name>#<n>.md` reports. A stop then carries
+        /// the first line of the report written during that turn.
+        #[arg(long)]
+        reports: Option<PathBuf>,
+    },
     /// Tag this terminal as a lead's worker, then exec the command.
     Tag {
         /// The lead's block id.

@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod events;
+mod follow;
 mod launch;
 mod lock;
 mod model;
@@ -144,6 +145,7 @@ fn run(cli: Cli) -> Result<()> {
             start_watcher(&exe);
             Ok(())
         }
+        Some(Command::Events { lead, reports }) => follow::run(&session, lead, reports),
         Some(Command::Tag { lead, task, cmd }) => tag::run(&lead, task.as_deref(), &cmd),
         Some(Command::Pin { lead, label }) => {
             let pinned = pin::run(
