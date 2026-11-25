@@ -134,6 +134,36 @@ them; `rexroster lua --loader` prints what Rex's init.lua loads them with): "Ros
 and "Roster: Show worker…" shows one of your workers. You don't need them;
 use `rexroster pin` and the commands above.
 
+## Follow your workers
+
+`rexroster events` prints one line each time one of your workers needs you,
+and nothing while they work. Run it under your harness's background monitor
+(Claude Code's Monitor tool), so each line wakes you and you never poll:
+
+```sh
+rexroster events "$REX_BLOCK" --reports <dir>
+```
+
+| Line | Means |
+| --- | --- |
+| `<name> ready` | a new worker reached its prompt: brief it |
+| `<name> done: <first line> (<path>)` | it stopped, and wrote that report this turn |
+| `<name> done: no report` | it stopped without one: read its screen |
+| `<name> blocked: <msg>` | a prompt is waiting; read the screen and answer it or raise it |
+| `<name> error: <msg>` | Claude Code reported an error |
+| `<name> exited` | its program exited; the block is still open |
+| `<name> closed` | its block closed |
+
+`idle` may stand in for `done`. A worker waiting on its own subagent counts as
+working, so a long review is not a stop. With `--reports`, have each worker
+write its final report to `<dir>/<name>#<n>.md`, first line the verdict, and
+not send it as a message: the stop line then carries the verdict, and one
+turn wakes you once. Start it after your first `spawn`; it exits by itself,
+status 0, once you have no workers left. A line `rexroster events: the rex
+event stream ended` and status 1 means the Rex server went away. A worker
+already blocked when it starts is reported straight away, so restarting it
+after a monitor timeout misses nothing.
+
 ## The watcher
 
 `rexroster watch` runs in the background, one per user per Rex server; `spawn`
