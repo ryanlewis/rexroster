@@ -35,7 +35,7 @@ const SETTLE: u64 = 10;
 const STATE_FILE: &str = ".rexroster-events.json";
 
 /// What the lead last knew about a worker.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 struct Seen {
     label: String,
     state: String,
@@ -144,7 +144,7 @@ impl Tracker {
         for row in rows {
             let prev = self.seen.get(&row.block).cloned();
             let was = prev.as_ref().map(|p| p.state.clone());
-            let mut w = prev.unwrap_or(Seen {
+            let mut w = prev.unwrap_or_else(|| Seen {
                 label: row.label.clone(),
                 state: String::new(),
                 turn: now,
@@ -184,11 +184,10 @@ impl Tracker {
             }
             self.seen.insert(row.block.clone(), w);
         }
-        let live: Vec<&str> = rows.iter().map(|r| r.block.as_str()).collect();
         let mut gone: Vec<String> = self
             .seen
             .keys()
-            .filter(|b| !live.contains(&b.as_str()))
+            .filter(|b| !rows.iter().any(|r| &r.block == *b))
             .cloned()
             .collect();
         gone.sort();
@@ -317,7 +316,8 @@ fn follow(
     model.refresh(cli, session, now())?;
     let mut out = std::io::stdout().lock();
     let mut step = |tracker: &mut Tracker, model: &Model| -> Result<()> {
-        for line in tracker.diff(&model.rows(now()), now(), reports) {
+        let now = now();
+        for line in tracker.diff(&model.rows(now), now, reports) {
             writeln!(out, "{line}")?;
         }
         out.flush()?;
