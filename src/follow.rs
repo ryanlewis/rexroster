@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::events::{self, Event};
 use crate::model::{Model, Row};
@@ -156,10 +156,25 @@ fn now() -> u64 {
         .unwrap_or_default()
 }
 
+/// A mistyped `--reports` would make every stop read `no report`, so it has
+/// to name a directory from the start.
+fn check_reports(dir: &Path) -> Result<()> {
+    let meta = std::fs::metadata(dir).with_context(|| format!("--reports {}", dir.display()))?;
+    anyhow::ensure!(
+        meta.is_dir(),
+        "--reports {}: not a directory",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// Follow the lead's workers until none is left, printing a line per change.
 /// A closed event stream prints a line too, then fails, so a lost Rex server
 /// is not mistaken for quiet workers.
 pub fn run(session: &str, lead: String, reports: Option<PathBuf>) -> Result<()> {
+    if let Some(dir) = &reports {
+        check_reports(dir)?;
+    }
     let cli = rex::Cli::new();
     let (tx, rx) = mpsc::channel::<Option<Event>>();
     // Subscribe before the first refresh so nothing falls between them.
@@ -288,6 +303,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn reports_must_be_an_existing_directory() {
+        let dir = reports_dir("check");
+        assert!(check_reports(&dir).is_ok());
+        let file = dir.join("file");
+        std::fs::write(&file, "").unwrap();
+        for bad in [dir.join("missing"), file] {
+            let err = format!("{:#}", check_reports(&bad).unwrap_err());
+            assert!(err.contains(&bad.display().to_string()), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
