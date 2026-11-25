@@ -47,6 +47,10 @@ allows it.
 
 ## Read a worker's state
 
+To wait on your workers, follow them with `rexroster events` (see
+[Follow your workers](#follow-your-workers)) rather than reading their state in
+a loop.
+
 Claude Code reports its state to Rex. Read that instead of the screen:
 
 ```sh
